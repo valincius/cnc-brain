@@ -10,8 +10,7 @@ fn main() -> Result<(), anyhow::Error> {
     port.write("G1 X20 Y15 F60\n".as_bytes());
     port.write("G1 X50 Y25 F60\n".as_bytes());
     port.write("G10 Y15 F60\n".as_bytes());
-    port.write("G1 G28\n".as_bytes());
-    port.write("G28 G1\n".as_bytes());
+    port.write("G55 Y99 X99\n".as_bytes());
 
     run_machine(port)?;
 
@@ -49,70 +48,65 @@ enum MotionMode {
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
-struct ParserState {
-    x: Option<f32>,
-    y: Option<f32>,
-    z: Option<f32>,
-    feed_rate: Option<f32>,
-    mode: Option<MotionMode>,
-    wcs: Option<u32>,
-}
-
-impl ParserState {
-    fn new() -> Self {
-        Self {
-            x: None,
-            y: None,
-            z: None,
-            feed_rate: None,
-            mode: None,
-            wcs: None,
-        }
-    }
+enum ParserState {
+    X(f32),
+    Y(f32),
+    Z(f32),
+    FeedRate(f32),
+    Mode(MotionMode),
+    Wcs(usize),
 }
 
 #[derive(Debug)]
 struct MachineState {
-    feed_rate: f32,
-    mode: MotionMode,
     active_wcs: usize,
+    mode: MotionMode,
+    feed_rate: f32,
     coordinates: Vec<(f32, f32, f32)>,
 }
 
 impl MachineState {
     fn new() -> Self {
         Self {
-            feed_rate: 0.0,
-            mode: MotionMode::Rapid,
             active_wcs: 0,
+            mode: MotionMode::Rapid,
+            feed_rate: 0.0,
             coordinates: vec![(0.0, 0.0, 0.0); 10],
         }
     }
 
-    fn apply_state(&mut self, new_state: ParserState) {
-        if let Some(mode) = new_state.mode {
-            self.mode = mode;
-            println!("Motion mode changed: {:?}", new_state.mode);
-        }
+    fn apply_state(&mut self, state: Vec<ParserState>) {
+        let mut sorted_state = state;
 
-        if let Some(x) = new_state.x {
-            self.coordinates[self.active_wcs].0 += x;
-            println!("Moved X to {}", self.coordinates[self.active_wcs].0);
-        }
+        // Define a sorting priority for each state
+        sorted_state.sort_by_key(|s| match s {
+            ParserState::Wcs(_) => 0,      // Highest priority
+            ParserState::FeedRate(_) => 1, // Medium priority
+            ParserState::Mode(_) => 2,     // Medium priority
+            ParserState::X(_) | ParserState::Y(_) | ParserState::Z(_) => 3, // Lowest priority
+        });
 
-        if let Some(y) = new_state.y {
-            self.coordinates[self.active_wcs].1 += y;
-            println!("Moved Y to {}", self.coordinates[self.active_wcs].1);
-        }
-
-        if let Some(z) = new_state.z {
-            self.coordinates[self.active_wcs].2 += z;
-            println!("Moved Z to {}", self.coordinates[self.active_wcs].2);
-        }
-
-        if let Some(feed_rate) = new_state.feed_rate {
-            self.feed_rate = feed_rate;
-            println!("Feed rate changed: {}", new_state.feed_rate.unwrap());
+        for s in sorted_state {
+            match s {
+                ParserState::X(x) => {
+                    self.coordinates[self.active_wcs].0 += x;
+                }
+                ParserState::Y(y) => {
+                    self.coordinates[self.active_wcs].1 += y;
+                }
+                ParserState::Z(z) => {
+                    self.coordinates[self.active_wcs].2 += z;
+                }
+                ParserState::FeedRate(f) => {
+                    self.feed_rate = f;
+                }
+                ParserState::Mode(m) => {
+                    self.mode = m;
+                }
+                ParserState::Wcs(wcs) => {
+                    self.active_wcs = wcs;
+                }
+            }
         }
     }
 }
@@ -133,11 +127,15 @@ enum GCodeError {
     ConflictingCommand(String, String),
 }
 
-struct GCodeParser {}
+struct GCodeParser {
+    line_regex: Regex,
+}
 
 impl GCodeParser {
     fn new() -> Self {
-        Self {}
+        Self {
+            line_regex: Regex::new(r"(([A-Z])(-?\d+)(\.\d+)?)\b").unwrap(),
+        }
     }
 
     fn parse_word(
@@ -169,10 +167,8 @@ impl GCodeParser {
         Ok((letter_char, number_val, mantissa_val))
     }
 
-    fn process_line(&mut self, line: &str) -> Result<ParserState, GCodeError> {
-        let re = Regex::new(r"(([A-Z])(-?\d+)(\.\d+)?)\b").unwrap();
-
-        let mut new_state = ParserState::new();
+    fn process_line(&mut self, line: &str) -> Result<Vec<ParserState>, GCodeError> {
+        let mut state = Vec::new();
 
         let modal_groups = vec![
             vec!["G4", "G10", "G28", "G30", "G53", "G92", "G92"],
@@ -205,7 +201,7 @@ impl GCodeParser {
 
         let mut consumed_groups = HashMap::new();
 
-        for caps in re.captures_iter(line) {
+        for caps in self.line_regex.captures_iter(line) {
             let _raw_word = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let raw_letter = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             let raw_number = caps.get(3).map(|m| m.as_str()).unwrap_or("");
@@ -246,31 +242,37 @@ impl GCodeParser {
             match (letter, number) {
                 ('G', _) => match number {
                     0 => {
-                        new_state.mode = Some(MotionMode::Rapid);
+                        state.push(ParserState::Mode(MotionMode::Rapid));
                     }
                     1 => {
-                        new_state.mode = Some(MotionMode::Linear);
+                        state.push(ParserState::Mode(MotionMode::Linear));
                     }
                     10 | 28 | 30 => {}
                     54..=59 => {
-                        new_state.wcs = Some(number - 54);
+                        state.push(ParserState::Wcs(number as usize - 54));
                     }
                     _ => return Err(GCodeError::UnsupportedNumber(letter, number)),
                 },
                 ('A' | 'B' | 'C' | 'X' | 'Y' | 'Z', _) => match letter {
-                    'X' => new_state.x = Some(full_number),
-                    'Y' => new_state.y = Some(full_number),
-                    'Z' => new_state.z = Some(full_number),
+                    'X' => {
+                        state.push(ParserState::X(full_number));
+                    }
+                    'Y' => {
+                        state.push(ParserState::Y(full_number));
+                    }
+                    'Z' => {
+                        state.push(ParserState::Z(full_number));
+                    }
                     _ => return Err(GCodeError::UnsupportedLetter(letter)),
                 },
                 ('F', _) => {
-                    new_state.feed_rate = Some(full_number);
+                    state.push(ParserState::FeedRate(full_number));
                 }
                 _ => return Err(GCodeError::UnsupportedLetter(letter)),
             }
         }
 
-        Ok(new_state)
+        Ok(state)
     }
 }
 
