@@ -98,13 +98,15 @@ pub struct GCodeParser {
     pub line_regex: Regex,
 }
 
-impl GCodeParser {
-    pub fn new() -> Self {
+impl Default for GCodeParser {
+    fn default() -> Self {
         Self {
             line_regex: Regex::new(r"(([A-Z])((-?\d+)\.?(\d+)?))\b").unwrap(),
         }
     }
+}
 
+impl GCodeParser {
     pub fn parse_word(caps: regex::Captures) -> Result<(char, f32, u32, Option<u32>), GCodeError> {
         let letter = caps.get(2).unwrap().as_str();
         let number = caps.get(3).unwrap().as_str();

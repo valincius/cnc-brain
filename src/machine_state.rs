@@ -76,8 +76,8 @@ pub struct MachineState {
     pub tool: usize,
 }
 
-impl MachineState {
-    pub fn new() -> Self {
+impl Default for MachineState {
+    fn default() -> Self {
         Self {
             position: (0.0, 0.0, 0.0),
             feed_rate: 0.0,
@@ -94,7 +94,9 @@ impl MachineState {
             override_mode: OverrideMode::Disable,
         }
     }
+}
 
+impl MachineState {
     pub fn apply_state(&mut self, state: Vec<ParserState>) {
         let word_x = state.iter().find_map(|s| match s {
             ParserState::X(x) => Some(*x),

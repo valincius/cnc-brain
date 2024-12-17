@@ -18,12 +18,12 @@ fn main() -> Result<(), anyhow::Error> {
 }
 
 fn run_machine(mut port: serialport::MockSerialport) -> Result<(), anyhow::Error> {
-    let mut parser = gcode_parser::GCodeParser::new();
+    let mut parser = gcode_parser::GCodeParser::default();
 
     let buffer = port.read();
     let lines = String::from_utf8_lossy(&buffer);
 
-    let mut machine = machine_state::MachineState::new();
+    let mut machine = machine_state::MachineState::default();
 
     for line in lines.lines() {
         match parser.process_line(line) {
