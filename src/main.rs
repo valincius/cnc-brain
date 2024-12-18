@@ -8,7 +8,7 @@ fn main() -> Result<(), anyhow::Error> {
     port.write("G0 X10 F30\n".as_bytes());
     port.write("G1 X20 Y15 F60\n".as_bytes());
     port.write("G1 X50 Y25 F60\n".as_bytes());
-    port.write("G10 L2 P1 Y15 F60\n".as_bytes());
+    port.write("G10 L2 P0 X99 Y15 F60\n".as_bytes());
     port.write("G55 Y99 X99\n".as_bytes());
     port.write("G0 G1 X99\n".as_bytes());
 
@@ -26,9 +26,13 @@ fn run_machine(mut port: serialport::MockSerialport) -> Result<(), anyhow::Error
     let mut machine = machine_state::MachineState::default();
 
     for line in lines.lines() {
-        match parser.process_line(line) {
-            Ok(state) => {
-                machine.apply_state(state);
+        match parser.parse_line(line) {
+            Ok(words) => {
+                if let Ok(command) = parser.build_command(words) {
+                    machine.apply_state(command);
+                } else {
+                    println!("Failed to execute '{}'", line);
+                }
             }
             Err(err) => {
                 println!("Errors in line '{}': {}", line, err);

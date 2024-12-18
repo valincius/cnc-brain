@@ -1,77 +1,86 @@
 use regex::Regex;
-use std::collections::HashSet;
 use thiserror::Error;
+
+use crate::machine_state::{
+    CircularDirection, CoordinateSystemOffsetMode, HomeMode, OptionalAxes, OptionalOffsets,
+    ProbeMode,
+};
 
 use super::machine_state;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
-pub enum LineMode {
-    MoveRapid,                             //G0
-    MoveLinear,                            //G1
-    MoveCircularCW,                        //G2
-    MoveCircularCCW,                       //G3
-    Probe,                                 //G38
-    Dwell,                                 //G4
-    SetCoordinateSystem,                   //G10
-    Home,                                  //G28
-    Home2,                                 //G30
-    MoveMachine,                           //G53
-    CoordinateSystemOffset,                //G92
-    DisableCoordinateSystemOffset,         //G92.1
-    DisableAndClearCoordinateSystemOffset, //G92.2
-    RestoreCoordinateSystemOffset,         //G92.3
-                                           // No canned cycles - G8x
+pub enum Function {
+    MoveRapid(OptionalAxes),  //G0
+    MoveLinear(OptionalAxes), //G1
+    MoveCircular(
+        CircularDirection,
+        OptionalAxes,
+        OptionalOffsets,
+        Option<f32>,
+    ), //G2
+    Probe(ProbeMode, OptionalAxes), //G38
+    Dwell(f32),               //G4
+    SetCoordinateSystem(u32, u32), //G10 L P
+    Home(HomeMode),           //G28
+    Home2(HomeMode),          //G30
+    MoveMachine(OptionalAxes), //G53
+    CoordinateSystemOffset(CoordinateSystemOffsetMode), //G92
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
-pub enum ParserState {
-    X(f32),
-    Y(f32),
-    Z(f32),
-    L(u32),
-    P(u32),
-    SpindleSpeed(f32),
-    FeedRate(f32),
-    Mode(LineMode),
-    Wcs(usize),
-    Plane(machine_state::Plane),
-    Units(machine_state::Units),
-    DistanceMode(machine_state::DistanceMode),
-    FeedRateMode(machine_state::FeedRateMode),
-    Stop(machine_state::StopMode),
-    SpindleMode(machine_state::SpindleMode),
-    CoolantMode(machine_state::CoolantMode),
-    OverrideMode(machine_state::OverrideMode),
-    SelectTool(usize),
-    ToolChange,
-    ToolLengthMode(machine_state::ToolLengthMode),
+pub enum Word {
+    A(f32),              // Axis
+    B(f32),              // Axis
+    C(f32),              // Axis
+    D(f32),              // Tool radius offset
+    F(f32),              // Feed rate
+    G(u32, Option<u32>), // General function
+    H(u32),              // Tool length offset index
+    I(f32),              // X-axis arc offset
+    J(f32),              // Y-axis arc offset
+    K(f32),              // Z-axis arc offset
+    L(u32),              // G10 key
+    M(u32),              // Miscellaneous function
+    N(u32),              // Line number
+    P(f32),              // Dwell time or G10 key
+    R(f32),              // Arc radius
+    S(f32),              // Spindle speed
+    T(u32),              // Tool selection
+    X(f32),              // X-axis
+    Y(f32),              // Y-axis
+    Z(f32),              // Z-axis
 }
 
-impl ParserState {
-    pub fn kind(self) -> &'static str {
-        match self {
-            ParserState::Mode(_) => "Mode",
-            ParserState::Wcs(_) => "Wcs",
-            ParserState::FeedRate(_) => "FeedRate",
-            ParserState::X(_) => "X",
-            ParserState::Y(_) => "Y",
-            ParserState::Z(_) => "Z",
-            ParserState::Plane(_) => "Plane",
-            ParserState::Units(_) => "Units",
-            ParserState::DistanceMode(_) => "DistanceMode",
-            ParserState::FeedRateMode(_) => "FeedRateMode",
-            ParserState::Stop(_) => "Stop",
-            ParserState::SpindleMode(_) => "SpindleMode",
-            ParserState::CoolantMode(_) => "CoolantMode",
-            ParserState::OverrideMode(_) => "OverrideMode",
-            ParserState::SelectTool(_) => "SelectTool",
-            ParserState::ToolChange => "ToolChange",
-            ParserState::SpindleSpeed(_) => "SpindleSpeed",
-            ParserState::L(_) => "L",
-            ParserState::P(_) => "P",
-            ParserState::ToolLengthMode(_) => "ToolLengthMode",
-        }
-    }
+#[macro_export]
+macro_rules! extract_word {
+    ($state:expr, $variant:path) => {
+        $state.iter().find_map(|s| {
+            if let $variant(inner) = s {
+                Some(*inner)
+            } else {
+                None
+            }
+        })
+    };
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum Action {
+    Function(Function),
+    SetSpindleSpeed(f32),
+    SetFeedRate(f32),
+    SetWCS(usize),
+    SetPlane(machine_state::Plane),
+    SetUnits(machine_state::Units),
+    SetDistanceMode(machine_state::DistanceMode),
+    SetFeedRateMode(machine_state::FeedRateMode),
+    SetSpindleMode(machine_state::SpindleMode),
+    SetCoolantMode(machine_state::CoolantMode),
+    SetOverrideMode(machine_state::OverrideMode),
+    SetSelectedTool(usize),
+    SetToolLengthMode(machine_state::ToolLengthMode),
+    Stop(machine_state::StopMode),
+    ToolChange,
 }
 
 #[derive(Error, Debug)]
@@ -92,6 +101,19 @@ pub enum GCodeError {
     ConflictingCommand(String, String),
     #[error("Missing required word ({0:?})")]
     MissingRequiredWord(String),
+    #[error("Unsupported word ({0:?})")]
+    UnsupportedWord(Word),
+    #[error("Invalid pattern ({0:?})")]
+    InvalidPattern(String),
+}
+
+macro_rules! select_match {
+    ($value:expr, $($pattern:pat => $result:expr),+ $(,)?) => {
+        match $value {
+            $($pattern => $result,)+
+            _ => return Err(GCodeError::InvalidPattern($value.to_string())),
+        }
+    };
 }
 
 pub struct GCodeParser {
@@ -141,108 +163,151 @@ impl GCodeParser {
         Ok((letter_char, number_val, whole_number_val, mantissa_val))
     }
 
-    pub fn process_line(&mut self, line: &str) -> Result<Vec<ParserState>, GCodeError> {
-        let mut state = Vec::new();
-        let mut seen_variants = HashSet::new();
-
-        let mut required_variants = Vec::new();
+    pub fn parse_line(&self, line: &str) -> Result<Vec<Word>, GCodeError> {
+        let mut words = Vec::new();
 
         for caps in self.line_regex.captures_iter(line) {
             let (letter, full_number, number, mantissa) = Self::parse_word(caps)?;
 
-            let new_state = match (letter, number) {
-                ('G', _) => match number {
-                    0 => ParserState::Mode(LineMode::MoveRapid),
-                    1 => ParserState::Mode(LineMode::MoveLinear),
-                    2 => ParserState::Mode(LineMode::MoveCircularCW),
-                    3 => ParserState::Mode(LineMode::MoveCircularCCW),
-                    4 => ParserState::Mode(LineMode::Dwell),
-                    10 => {
-                        required_variants = vec!["L", "P"];
-                        ParserState::Mode(LineMode::SetCoordinateSystem)
-                    }
-                    17 => ParserState::Plane(machine_state::Plane::XY),
-                    18 => ParserState::Plane(machine_state::Plane::XZ),
-                    19 => ParserState::Plane(machine_state::Plane::YZ),
-                    20 => ParserState::Units(machine_state::Units::Inches),
-                    21 => ParserState::Units(machine_state::Units::Millimeters),
-                    28 => ParserState::Mode(LineMode::Home),
-                    30 => ParserState::Mode(LineMode::Home2),
-                    38 => ParserState::Mode(LineMode::Probe),
-                    43 => match mantissa {
-                        Some(1) => ParserState::ToolLengthMode(machine_state::ToolLengthMode::Set(
-                            full_number,
-                        )),
-                        Some(2) => ParserState::ToolLengthMode(machine_state::ToolLengthMode::Add(
-                            full_number,
-                        )),
-                        Some(3) => {
-                            ParserState::ToolLengthMode(machine_state::ToolLengthMode::Cancel)
-                        }
-                        _ => return Err(GCodeError::UnsupportedMantissa(mantissa)),
-                    },
-                    53 => ParserState::Mode(LineMode::MoveMachine),
-                    54..=59 => ParserState::Wcs(number as usize - 54),
-                    90 => ParserState::DistanceMode(machine_state::DistanceMode::Absolute),
-                    91 => ParserState::DistanceMode(machine_state::DistanceMode::Incremental),
-                    92 => match mantissa {
-                        None => ParserState::Mode(LineMode::CoordinateSystemOffset),
-                        Some(1) => ParserState::Mode(LineMode::DisableCoordinateSystemOffset),
-                        Some(2) => {
-                            ParserState::Mode(LineMode::DisableAndClearCoordinateSystemOffset)
-                        }
-                        Some(3) => ParserState::Mode(LineMode::RestoreCoordinateSystemOffset),
-                        _ => return Err(GCodeError::UnsupportedMantissa(mantissa)),
-                    },
-                    93 => ParserState::FeedRateMode(machine_state::FeedRateMode::InverseTime),
-                    94 => ParserState::FeedRateMode(machine_state::FeedRateMode::UnitsPerMinute),
-                    _ => return Err(GCodeError::UnsupportedNumber(letter, number)),
-                },
-                ('M', _) => match number {
-                    0 => ParserState::Stop(machine_state::StopMode::ProgramStop),
-                    1 => ParserState::Stop(machine_state::StopMode::OptionalStop),
-                    2 => ParserState::Stop(machine_state::StopMode::ProgramEnd),
-                    3 => ParserState::SpindleMode(machine_state::SpindleMode::Clockwise),
-                    4 => ParserState::SpindleMode(machine_state::SpindleMode::CounterClockwise),
-                    5 => ParserState::SpindleMode(machine_state::SpindleMode::Stop),
-                    6 => ParserState::ToolChange,
-                    7 => ParserState::CoolantMode(machine_state::CoolantMode::Mist),
-                    8 => ParserState::CoolantMode(machine_state::CoolantMode::Flood),
-                    9 => ParserState::CoolantMode(machine_state::CoolantMode::None),
-                    48 => ParserState::OverrideMode(machine_state::OverrideMode::Enable),
-                    49 => ParserState::OverrideMode(machine_state::OverrideMode::Disable),
-                    _ => return Err(GCodeError::UnsupportedNumber(letter, number)),
-                },
-                ('X', _) => ParserState::X(full_number),
-                ('Y', _) => ParserState::Y(full_number),
-                ('Z', _) => ParserState::Z(full_number),
-                ('F', _) => ParserState::FeedRate(full_number),
-                ('S', _) => ParserState::SpindleSpeed(full_number),
-                ('T', _) => ParserState::SelectTool(number as usize),
-                ('L', _) => ParserState::L(number),
-                ('P', _) => ParserState::P(number),
+            match letter {
+                'A' => words.push(Word::A(full_number)),
+                'B' => words.push(Word::B(full_number)),
+                'C' => words.push(Word::C(full_number)),
+                'D' => words.push(Word::D(full_number)),
+                'F' => words.push(Word::F(full_number)),
+                'G' => words.push(Word::G(number, mantissa)),
+                'H' => words.push(Word::H(number)),
+                'I' => words.push(Word::I(full_number)),
+                'J' => words.push(Word::J(full_number)),
+                'K' => words.push(Word::K(full_number)),
+                'L' => words.push(Word::L(number)),
+                'M' => words.push(Word::M(number)),
+                'N' => words.push(Word::N(number)),
+                'P' => words.push(Word::P(full_number)),
+                'S' => words.push(Word::S(full_number)),
+                'T' => words.push(Word::T(number)),
+                'X' => words.push(Word::X(full_number)),
+                'Y' => words.push(Word::Y(full_number)),
+                'Z' => words.push(Word::Z(full_number)),
                 _ => return Err(GCodeError::UnsupportedLetter(letter)),
+            }
+        }
+
+        Ok(words)
+    }
+
+    pub fn build_command(&mut self, words: Vec<Word>) -> Result<Vec<Action>, GCodeError> {
+        let mut commands = Vec::new();
+
+        let optional_axes = OptionalAxes::from_words(&words);
+
+        let g_words = words.iter().filter_map(|w| match w {
+            Word::G(number, mantissa) => Some((*number, *mantissa)),
+            _ => None,
+        });
+
+        let m_words = words.iter().filter_map(|w| match w {
+            Word::M(number) => Some(*number),
+            _ => None,
+        });
+
+        for (number, mantissa) in g_words {
+            let command = match number {
+                0 => Action::Function(Function::MoveRapid(optional_axes)),
+                1 => Action::Function(Function::MoveLinear(optional_axes)),
+                2 | 3 => Action::Function(Function::MoveCircular(
+                    select_match!(
+                        number,
+                        2 => CircularDirection::Clockwise,
+                        3 => CircularDirection::CounterClockwise
+                    ),
+                    optional_axes,
+                    OptionalOffsets::from_words(&words),
+                    extract_word!(words, Word::R),
+                )),
+                4 => Action::Function(Function::Dwell(extract_word!(words, Word::P).unwrap())),
+                10 => Action::Function(Function::SetCoordinateSystem(
+                    extract_word!(words, Word::L).unwrap(),
+                    extract_word!(words, Word::P).unwrap() as u32,
+                )),
+                17 => Action::SetPlane(machine_state::Plane::XY),
+                18 => Action::SetPlane(machine_state::Plane::XZ),
+                19 => Action::SetPlane(machine_state::Plane::YZ),
+                20 => Action::SetUnits(machine_state::Units::Inches),
+                21 => Action::SetUnits(machine_state::Units::Millimeters),
+                28 => Action::Function(Function::Home(match mantissa {
+                    None => HomeMode::Go,
+                    Some(1) => HomeMode::Set(optional_axes),
+                    _ => return Err(GCodeError::UnsupportedMantissa(mantissa)),
+                })),
+                30 => Action::Function(Function::Home2(match mantissa {
+                    None => HomeMode::Go,
+                    Some(1) => HomeMode::Set(optional_axes),
+                    _ => return Err(GCodeError::UnsupportedMantissa(mantissa)),
+                })),
+                38 => Action::Function(Function::Probe(
+                    match mantissa {
+                        Some(2) => ProbeMode::TowardWorkpieceErroring,
+                        Some(3) => ProbeMode::TowardWorkpieceNonErroring,
+                        Some(4) => ProbeMode::AwayFromWorkpieceErroring,
+                        Some(5) => ProbeMode::AwayFromWorkpieceNonErroring,
+                        _ => return Err(GCodeError::UnsupportedMantissa(mantissa)),
+                    },
+                    optional_axes,
+                )),
+                43 => match mantissa {
+                    Some(1) => {
+                        Action::SetToolLengthMode(machine_state::ToolLengthMode::Set(optional_axes))
+                    }
+                    Some(2) => {
+                        Action::SetToolLengthMode(machine_state::ToolLengthMode::Add(optional_axes))
+                    }
+                    Some(3) => Action::SetToolLengthMode(machine_state::ToolLengthMode::Cancel),
+                    _ => return Err(GCodeError::UnsupportedMantissa(mantissa)),
+                },
+                53 => Action::Function(Function::MoveMachine(optional_axes)),
+                54..=59 => Action::SetWCS(number as usize - 54),
+                90 => Action::SetDistanceMode(machine_state::DistanceMode::Absolute),
+                91 => Action::SetDistanceMode(machine_state::DistanceMode::Incremental),
+                92 => Action::Function(Function::CoordinateSystemOffset(match mantissa {
+                    None => CoordinateSystemOffsetMode::Set(OptionalOffsets::from_words(&words)),
+                    Some(1) => CoordinateSystemOffsetMode::DisableAndZero,
+                    Some(2) => CoordinateSystemOffsetMode::Disable,
+                    Some(3) => CoordinateSystemOffsetMode::Restore,
+                    _ => return Err(GCodeError::UnsupportedMantissa(mantissa)),
+                })),
+                93 => Action::SetFeedRateMode(machine_state::FeedRateMode::InverseTime),
+                94 => Action::SetFeedRateMode(machine_state::FeedRateMode::UnitsPerMinute),
+                _ => return Err(GCodeError::UnsupportedNumber('G', number)),
+            };
+            commands.push(command);
+        }
+
+        for number in m_words {
+            let command = match number {
+                0 => Action::Stop(machine_state::StopMode::ProgramStop),
+                1 => Action::Stop(machine_state::StopMode::OptionalStop),
+                2 => Action::Stop(machine_state::StopMode::ProgramEnd),
+                3 | 4 => {
+                    Action::SetSpindleMode(machine_state::SpindleMode::Direction(select_match!(
+                        number,
+                        3 => CircularDirection::Clockwise,
+                        4 => CircularDirection::CounterClockwise
+                    )))
+                }
+                5 => Action::SetSpindleMode(machine_state::SpindleMode::Stop),
+                6 => Action::ToolChange,
+                7 => Action::SetCoolantMode(machine_state::CoolantMode::Mist),
+                8 => Action::SetCoolantMode(machine_state::CoolantMode::Flood),
+                9 => Action::SetCoolantMode(machine_state::CoolantMode::None),
+                48 => Action::SetOverrideMode(machine_state::OverrideMode::Enable),
+                49 => Action::SetOverrideMode(machine_state::OverrideMode::Disable),
+                _ => return Err(GCodeError::UnsupportedNumber('M', number)),
             };
 
-            let kind = new_state.kind();
-            if seen_variants.contains(kind) {
-                return Err(GCodeError::ConflictingCommand(
-                    kind.to_string(),
-                    format!("{:?}", new_state),
-                ));
-            } else {
-                seen_variants.insert(kind);
-            }
-
-            state.push(new_state);
+            commands.push(command);
         }
 
-        for required in required_variants.iter() {
-            if !seen_variants.contains(required) {
-                return Err(GCodeError::MissingRequiredWord(required.to_string()));
-            }
-        }
-
-        Ok(state)
+        Ok(commands)
     }
 }

@@ -1,4 +1,9 @@
-use super::gcode_parser::{LineMode, ParserState};
+use crate::{
+    extract_word,
+    gcode_parser::{Action, Word},
+};
+
+use super::gcode_parser::Function;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum Plane {
@@ -33,9 +38,14 @@ pub enum FeedRateMode {
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
-pub enum SpindleMode {
+pub enum CircularDirection {
     Clockwise,
     CounterClockwise,
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum SpindleMode {
+    Direction(CircularDirection),
     Stop,
 }
 
@@ -52,20 +62,106 @@ pub enum OverrideMode {
     Disable,
 }
 
+#[derive(Debug, PartialEq, Copy, Clone, Default)]
+pub struct OptionalAxes {
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+    pub z: Option<f32>,
+
+    pub a: Option<f32>,
+    pub b: Option<f32>,
+    pub c: Option<f32>,
+}
+
+impl OptionalAxes {
+    pub fn from_words(words: &[Word]) -> Self {
+        Self {
+            x: extract_word!(words, Word::X),
+            y: extract_word!(words, Word::Y),
+            z: extract_word!(words, Word::Z),
+            a: extract_word!(words, Word::A),
+            b: extract_word!(words, Word::B),
+            c: extract_word!(words, Word::C),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Copy, Clone, Default)]
+pub struct OptionalOffsets {
+    pub i: Option<f32>,
+    pub j: Option<f32>,
+    pub k: Option<f32>,
+}
+
+impl OptionalOffsets {
+    pub fn from_words(words: &[Word]) -> Self {
+        Self {
+            i: extract_word!(words, Word::I),
+            j: extract_word!(words, Word::J),
+            k: extract_word!(words, Word::K),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub struct Axes {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+}
+
+impl Default for Axes {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            a: 0.0,
+            b: 0.0,
+            c: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum ToolLengthMode {
-    Set(f32),
-    Add(f32),
+    Set(OptionalAxes),
+    Add(OptionalAxes),
     Cancel,
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum ProbeMode {
+    TowardWorkpieceErroring,
+    TowardWorkpieceNonErroring,
+    AwayFromWorkpieceErroring,
+    AwayFromWorkpieceNonErroring,
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum HomeMode {
+    Go,
+    Set(OptionalAxes),
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum CoordinateSystemOffsetMode {
+    Set(OptionalOffsets),
+    DisableAndZero,
+    Disable,
+    Restore,
 }
 
 #[derive(Debug)]
 pub struct MachineState {
-    pub position: (f32, f32, f32),
+    pub position: Axes,
     pub feed_rate: f32,
     pub spindle_speed: f32,
     pub active_wcs: usize,
-    pub wcs_offsets: Vec<(f32, f32, f32)>,
+    pub wcs_offsets: Vec<Axes>,
     pub plane: Plane,
     pub units: Units,
     pub distance_mode: DistanceMode,
@@ -79,12 +175,12 @@ pub struct MachineState {
 impl Default for MachineState {
     fn default() -> Self {
         Self {
-            position: (0.0, 0.0, 0.0),
+            position: Axes::default(),
             feed_rate: 0.0,
             spindle_speed: 0.0,
             tool: 0,
             active_wcs: 0,
-            wcs_offsets: vec![(0.0, 0.0, 0.0); 10],
+            wcs_offsets: vec![Axes::default(); 10],
             plane: Plane::XY,
             units: Units::Inches,
             distance_mode: DistanceMode::Absolute,
@@ -97,52 +193,48 @@ impl Default for MachineState {
 }
 
 impl MachineState {
-    pub fn apply_state(&mut self, state: Vec<ParserState>) {
-        let word_x = state.iter().find_map(|s| match s {
-            ParserState::X(x) => Some(*x),
-            _ => None,
-        });
-        let word_y = state.iter().find_map(|s| match s {
-            ParserState::Y(y) => Some(*y),
-            _ => None,
-        });
-        let word_z = state.iter().find_map(|s| match s {
-            ParserState::Z(z) => Some(*z),
-            _ => None,
-        });
-        let word_l = state.iter().find_map(|s| match s {
-            ParserState::L(l) => Some(*l),
-            _ => None,
-        });
-        let word_p = state.iter().find_map(|s| match s {
-            ParserState::P(p) => Some(*p),
-            _ => None,
-        });
-
-        for s in state {
+    pub fn apply_state(&mut self, state: Vec<Action>) {
+        for s in state.clone() {
             match s {
-                ParserState::FeedRate(f) => {
+                Action::Function(mode) => match mode {
+                    Function::SetCoordinateSystem(2, p) => {
+                        // let wcs = self.wcs_offsets[p as usize].borrow_mut();
+                        // if let Some(x) = extract_word!(&state, Word::X) {
+                        //     wcs.0 = x;
+                        // }
+                        // if let Some(y) = extract_word!(&state, Word::Y) {
+                        //     wcs.1 = y;
+                        // }
+                        // if let Some(z) = extract_word!(&state, Word::Z) {
+                        //     wcs.2 = z;
+                        // }
+                    }
+                    _ => {
+                        println!("Skipping mode: {:?}", mode);
+                    }
+                },
+                Action::SetFeedRate(f) => {
                     self.feed_rate = f;
                 }
-                ParserState::SpindleSpeed(s) => {
+                Action::SetSpindleSpeed(s) => {
                     self.spindle_speed = s;
                 }
-                ParserState::Wcs(wcs) => {
+                Action::SetWCS(wcs) => {
                     self.active_wcs = wcs;
                 }
-                ParserState::Plane(p) => {
+                Action::SetPlane(p) => {
                     self.plane = p;
                 }
-                ParserState::Units(u) => {
+                Action::SetUnits(u) => {
                     self.units = u;
                 }
-                ParserState::DistanceMode(m) => {
+                Action::SetDistanceMode(m) => {
                     self.distance_mode = m;
                 }
-                ParserState::FeedRateMode(m) => {
+                Action::SetFeedRateMode(m) => {
                     self.feed_rate_mode = m;
                 }
-                ParserState::Stop(m) => match m {
+                Action::Stop(m) => match m {
                     StopMode::ProgramStop => {
                         todo!("Program stop");
                     }
@@ -153,48 +245,32 @@ impl MachineState {
                         todo!("Program end");
                     }
                 },
-                ParserState::SpindleMode(m) => {
+                Action::SetSpindleMode(m) => {
                     self.spindle_mode = m;
                 }
-                ParserState::CoolantMode(m) => {
+                Action::SetCoolantMode(m) => {
                     self.coolant_mode = m;
                 }
-                ParserState::OverrideMode(m) => {
+                Action::SetOverrideMode(m) => {
                     self.override_mode = m;
                 }
-                ParserState::SelectTool(t) => {
+                Action::SetSelectedTool(t) => {
                     self.tool = t;
                 }
-                ParserState::ToolChange => {
-                    todo!("Tool change");
+                Action::ToolChange => {
+                    println!("Tool change");
                 }
-                ParserState::Mode(mode) => match mode {
-                    LineMode::SetCoordinateSystem => match word_l {
-                        Some(2) => {
-                            if let Some(x) = word_x {
-                                self.wcs_offsets[self.active_wcs].0 = x;
-                            }
-                            if let Some(y) = word_y {
-                                self.wcs_offsets[self.active_wcs].1 = y;
-                            }
-                            if let Some(z) = word_z {
-                                self.wcs_offsets[self.active_wcs].2 = z;
-                            }
-                        }
-                        Some(20) => {
-                            // G10 L20 is similar to G10 L2 except that instead of setting the offset/entry to the given value, it is set to a calculated value that makes the current coordinates become the given value.
-                            todo!("G10 L20");
-                        }
-                        _ => {
-                            todo!("Unsupported coordinate system");
-                        }
-                    },
-                    LineMode::CoordinateSystemOffset => {
-                        todo!("Coordinate system offset");
+                Action::SetToolLengthMode(mode) => match mode {
+                    ToolLengthMode::Set(_axes) => {
+                        println!("Tool length mode set");
                     }
-                    _ => {}
+                    ToolLengthMode::Add(_axes) => {
+                        println!("Tool length mode add");
+                    }
+                    ToolLengthMode::Cancel => {
+                        todo!("Tool length mode cancel");
+                    }
                 },
-                _ => {}
             }
         }
     }
