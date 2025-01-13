@@ -156,7 +156,7 @@ pub enum CoordinateSystemOffsetMode {
 }
 
 #[derive(Debug)]
-pub struct MachineState {
+pub struct GrblState {
     pub position: Axes,
     pub feed_rate: f32,
     pub spindle_speed: f32,
@@ -172,7 +172,7 @@ pub struct MachineState {
     pub tool: usize,
 }
 
-impl Default for MachineState {
+impl Default for GrblState {
     fn default() -> Self {
         Self {
             position: Axes::default(),
@@ -192,12 +192,12 @@ impl Default for MachineState {
     }
 }
 
-impl MachineState {
+impl GrblState {
     pub fn apply_state(&mut self, state: Vec<Action>) {
         for s in state.clone() {
             match s {
                 Action::Function(mode) => match mode {
-                    Function::SetCoordinateSystem(2, p) => {
+                    Function::SetCoordinateSystem(2, _p) => {
                         // let wcs = self.wcs_offsets[p as usize].borrow_mut();
                         // if let Some(x) = extract_word!(&state, Word::X) {
                         //     wcs.0 = x;

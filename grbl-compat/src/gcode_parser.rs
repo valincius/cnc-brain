@@ -1,12 +1,10 @@
 use regex::Regex;
 use thiserror::Error;
 
-use crate::machine_state::{
-    CircularDirection, CoordinateSystemOffsetMode, HomeMode, OptionalAxes, OptionalOffsets,
+use crate::grbl_state::{
+    self, CircularDirection, CoordinateSystemOffsetMode, HomeMode, OptionalAxes, OptionalOffsets,
     ProbeMode,
 };
-
-use super::machine_state;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum Function {
@@ -70,16 +68,16 @@ pub enum Action {
     SetSpindleSpeed(f32),
     SetFeedRate(f32),
     SetWCS(usize),
-    SetPlane(machine_state::Plane),
-    SetUnits(machine_state::Units),
-    SetDistanceMode(machine_state::DistanceMode),
-    SetFeedRateMode(machine_state::FeedRateMode),
-    SetSpindleMode(machine_state::SpindleMode),
-    SetCoolantMode(machine_state::CoolantMode),
-    SetOverrideMode(machine_state::OverrideMode),
+    SetPlane(grbl_state::Plane),
+    SetUnits(grbl_state::Units),
+    SetDistanceMode(grbl_state::DistanceMode),
+    SetFeedRateMode(grbl_state::FeedRateMode),
+    SetSpindleMode(grbl_state::SpindleMode),
+    SetCoolantMode(grbl_state::CoolantMode),
+    SetOverrideMode(grbl_state::OverrideMode),
     SetSelectedTool(usize),
-    SetToolLengthMode(machine_state::ToolLengthMode),
-    Stop(machine_state::StopMode),
+    SetToolLengthMode(grbl_state::ToolLengthMode),
+    Stop(grbl_state::StopMode),
     ToolChange,
 }
 
@@ -230,11 +228,11 @@ impl GCodeParser {
                     extract_word!(words, Word::L).unwrap(),
                     extract_word!(words, Word::P).unwrap() as u32,
                 )),
-                17 => Action::SetPlane(machine_state::Plane::XY),
-                18 => Action::SetPlane(machine_state::Plane::XZ),
-                19 => Action::SetPlane(machine_state::Plane::YZ),
-                20 => Action::SetUnits(machine_state::Units::Inches),
-                21 => Action::SetUnits(machine_state::Units::Millimeters),
+                17 => Action::SetPlane(grbl_state::Plane::XY),
+                18 => Action::SetPlane(grbl_state::Plane::XZ),
+                19 => Action::SetPlane(grbl_state::Plane::YZ),
+                20 => Action::SetUnits(grbl_state::Units::Inches),
+                21 => Action::SetUnits(grbl_state::Units::Millimeters),
                 28 => Action::Function(Function::Home(match mantissa {
                     None => HomeMode::Go,
                     Some(1) => HomeMode::Set(optional_axes),
@@ -257,18 +255,18 @@ impl GCodeParser {
                 )),
                 43 => match mantissa {
                     Some(1) => {
-                        Action::SetToolLengthMode(machine_state::ToolLengthMode::Set(optional_axes))
+                        Action::SetToolLengthMode(grbl_state::ToolLengthMode::Set(optional_axes))
                     }
                     Some(2) => {
-                        Action::SetToolLengthMode(machine_state::ToolLengthMode::Add(optional_axes))
+                        Action::SetToolLengthMode(grbl_state::ToolLengthMode::Add(optional_axes))
                     }
-                    Some(3) => Action::SetToolLengthMode(machine_state::ToolLengthMode::Cancel),
+                    Some(3) => Action::SetToolLengthMode(grbl_state::ToolLengthMode::Cancel),
                     _ => return Err(GCodeError::UnsupportedMantissa(mantissa)),
                 },
                 53 => Action::Function(Function::MoveMachine(optional_axes)),
                 54..=59 => Action::SetWCS(number as usize - 54),
-                90 => Action::SetDistanceMode(machine_state::DistanceMode::Absolute),
-                91 => Action::SetDistanceMode(machine_state::DistanceMode::Incremental),
+                90 => Action::SetDistanceMode(grbl_state::DistanceMode::Absolute),
+                91 => Action::SetDistanceMode(grbl_state::DistanceMode::Incremental),
                 92 => Action::Function(Function::CoordinateSystemOffset(match mantissa {
                     None => CoordinateSystemOffsetMode::Set(OptionalOffsets::from_words(&words)),
                     Some(1) => CoordinateSystemOffsetMode::DisableAndZero,
@@ -276,8 +274,8 @@ impl GCodeParser {
                     Some(3) => CoordinateSystemOffsetMode::Restore,
                     _ => return Err(GCodeError::UnsupportedMantissa(mantissa)),
                 })),
-                93 => Action::SetFeedRateMode(machine_state::FeedRateMode::InverseTime),
-                94 => Action::SetFeedRateMode(machine_state::FeedRateMode::UnitsPerMinute),
+                93 => Action::SetFeedRateMode(grbl_state::FeedRateMode::InverseTime),
+                94 => Action::SetFeedRateMode(grbl_state::FeedRateMode::UnitsPerMinute),
                 _ => return Err(GCodeError::UnsupportedNumber('G', number)),
             };
             commands.push(command);
@@ -285,23 +283,21 @@ impl GCodeParser {
 
         for number in m_words {
             let command = match number {
-                0 => Action::Stop(machine_state::StopMode::ProgramStop),
-                1 => Action::Stop(machine_state::StopMode::OptionalStop),
-                2 => Action::Stop(machine_state::StopMode::ProgramEnd),
-                3 | 4 => {
-                    Action::SetSpindleMode(machine_state::SpindleMode::Direction(select_match!(
-                        number,
-                        3 => CircularDirection::Clockwise,
-                        4 => CircularDirection::CounterClockwise
-                    )))
-                }
-                5 => Action::SetSpindleMode(machine_state::SpindleMode::Stop),
+                0 => Action::Stop(grbl_state::StopMode::ProgramStop),
+                1 => Action::Stop(grbl_state::StopMode::OptionalStop),
+                2 => Action::Stop(grbl_state::StopMode::ProgramEnd),
+                3 | 4 => Action::SetSpindleMode(grbl_state::SpindleMode::Direction(select_match!(
+                    number,
+                    3 => CircularDirection::Clockwise,
+                    4 => CircularDirection::CounterClockwise
+                ))),
+                5 => Action::SetSpindleMode(grbl_state::SpindleMode::Stop),
                 6 => Action::ToolChange,
-                7 => Action::SetCoolantMode(machine_state::CoolantMode::Mist),
-                8 => Action::SetCoolantMode(machine_state::CoolantMode::Flood),
-                9 => Action::SetCoolantMode(machine_state::CoolantMode::None),
-                48 => Action::SetOverrideMode(machine_state::OverrideMode::Enable),
-                49 => Action::SetOverrideMode(machine_state::OverrideMode::Disable),
+                7 => Action::SetCoolantMode(grbl_state::CoolantMode::Mist),
+                8 => Action::SetCoolantMode(grbl_state::CoolantMode::Flood),
+                9 => Action::SetCoolantMode(grbl_state::CoolantMode::None),
+                48 => Action::SetOverrideMode(grbl_state::OverrideMode::Enable),
+                49 => Action::SetOverrideMode(grbl_state::OverrideMode::Disable),
                 _ => return Err(GCodeError::UnsupportedNumber('M', number)),
             };
 

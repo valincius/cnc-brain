@@ -22,6 +22,16 @@ name = "cnc-brain"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "grbl-compat",
+ "regex",
+ "thiserror",
+]
+
+[[package]]
+name = "grbl-compat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "regex",
  "thiserror",
 ]

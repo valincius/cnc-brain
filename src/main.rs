@@ -1,7 +1,5 @@
-use cnc_brain::{
-    gcode_parser, machine_state,
-    serialport::{self, Serialport},
-};
+use cnc_brain::serialport::{self, Serialport};
+use grbl_compat::{gcode_parser, grbl_state};
 
 fn main() -> Result<(), anyhow::Error> {
     let mut port = serialport::MockSerialport::default();
@@ -23,7 +21,7 @@ fn run_machine(mut port: serialport::MockSerialport) -> Result<(), anyhow::Error
     let buffer = port.read();
     let lines = String::from_utf8_lossy(&buffer);
 
-    let mut machine = machine_state::MachineState::default();
+    let mut machine = grbl_state::GrblState::default();
 
     for line in lines.lines() {
         match parser.parse_line(line) {
