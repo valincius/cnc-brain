@@ -62,6 +62,13 @@ pub enum OverrideMode {
     Disable,
 }
 
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum MotionMode {
+    Rapid,
+    Linear,
+    Circular,
+}
+
 #[derive(Debug, PartialEq, Copy, Clone, Default)]
 pub struct OptionalAxes {
     pub x: Option<f32>,
@@ -164,6 +171,7 @@ pub struct GrblState {
     pub wcs_offsets: Vec<Axes>,
     pub plane: Plane,
     pub units: Units,
+    pub motion_mode: MotionMode,
     pub distance_mode: DistanceMode,
     pub feed_rate_mode: FeedRateMode,
     pub spindle_mode: SpindleMode,
@@ -183,6 +191,7 @@ impl Default for GrblState {
             wcs_offsets: vec![Axes::default(); 10],
             plane: Plane::XY,
             units: Units::Inches,
+            motion_mode: MotionMode::Rapid,
             distance_mode: DistanceMode::Absolute,
             feed_rate_mode: FeedRateMode::UnitsPerMinute,
             spindle_mode: SpindleMode::Stop,
@@ -208,6 +217,18 @@ impl GrblState {
                         // if let Some(z) = extract_word!(&state, Word::Z) {
                         //     wcs.2 = z;
                         // }
+                    }
+                    Function::MoveRapid(_) => {
+                        self.motion_mode = MotionMode::Rapid;
+                    }
+                    Function::MoveLinear(_) => {
+                        self.motion_mode = MotionMode::Linear;
+                    }
+                    Function::MoveCircular(_, _, _, _) => {
+                        self.motion_mode = MotionMode::Circular;
+                    }
+                    Function::MoveMachine(_) => {
+                        todo!("Move machine");
                     }
                     _ => {
                         println!("Skipping mode: {:?}", mode);
