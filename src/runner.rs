@@ -1,345 +1,290 @@
-/*************************************************
- * Constants
- *************************************************/
-const DEFAULT_ACCELERATION: f32 = 50.0; // mm/s^2
-const DT: f32 = 0.001; // 1 ms time step (for the run loop)
-const EPSILON: f32 = 1e-6; // small float tolerance
+use std::time::Duration;
 
-/*************************************************
- * Program & Instructions
- *************************************************/
+use tokio::time::sleep;
+
+use crate::{Coordinates, MotionSegment, Movement};
+
 #[derive(Debug)]
-pub enum Instruction {
-    Rapid(f32, MotionInputs),
-    Linear(f32, MotionInputs),
-    // Arcs, Wait, etc. omitted for brevity
+pub struct MachineSettings {
+    pub max_acceleration: f32, // mm/s^2
+    pub max_velocity: f32,     // mm/s
 }
 
-#[derive(Debug, Default)]
-pub struct MotionInputs {
-    pub x: Option<f32>,
-    pub y: Option<f32>,
-    pub z: Option<f32>,
+impl Default for MachineSettings {
+    fn default() -> Self {
+        Self {
+            max_acceleration: 50.0,
+            max_velocity: 100.0,
+        }
+    }
 }
 
-/*************************************************
- * Machine State
- *************************************************/
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MachineState {
+    pub settings: MachineSettings,
+
     pub x: f32,
     pub y: f32,
     pub z: f32,
 
-    pub motion_buffer: Vec<MotionSegment>,
+    pub target_v: f32,
 
-    pub current_segment: usize,
-    pub current_sub_segment: usize,
-    pub t_elapsed_in_sub: f32,
-    pub dist_prev: f32,
+    pub motion_buffer: Vec<MotionSegment>,
+}
+
+impl Default for MachineState {
+    fn default() -> Self {
+        Self {
+            settings: MachineSettings::default(),
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            target_v: 0.0,
+            motion_buffer: Vec::new(),
+        }
+    }
 }
 
 impl MachineState {
-    pub fn set_pos(&mut self, x: f32, y: f32, z: f32) {
-        self.x = x;
-        self.y = y;
-        self.z = z;
+    pub async fn move_to(&mut self, segment: MotionSegment) {
+        let dt = 0.001; // 1 ms time step in seconds
 
-        println!("Position: X: {:.2}mm, Y: {:.2}mm, Z: {:.2}mm", x, y, z);
-    }
+        let a_max = self.settings.max_acceleration;
+        let v_in = segment.v_in;
+        let v_out = segment.v_out;
+        let v_max = segment.v_max.min(self.settings.max_velocity);
+        let distance = segment.distance;
 
-    pub fn push_motions(&mut self, motions: Vec<MotionSegment>) {
-        self.motion_buffer.extend(motions);
-    }
+        // 1) Compute times for each phase
+        let t1 = (v_max - v_in) / a_max; // time to accelerate from v_in to v_max
+        let t3 = (v_max - v_out) / a_max; // time to decelerate from v_max to v_out
 
-    pub async fn step(&mut self) {
-        if self.current_segment >= self.motion_buffer.len() {
-            return;
-        }
+        // distance covered in accel (phase 1) and decel (phase 3)
+        let d_acc = 0.5 * (v_in + v_max) * t1;
+        let d_dec = 0.5 * (v_max + v_out) * t3;
 
-        let seg = &self.motion_buffer[self.current_segment];
-        let sub = &seg.sub_segments[self.current_sub_segment];
-
-        if self.t_elapsed_in_sub < sub.t {
-            let dt = DT.min(sub.t - self.t_elapsed_in_sub);
-            self.t_elapsed_in_sub += dt;
-
-            let dist_new = distance_at_time(
-                sub.v_start,
-                sub.accel_start,
-                sub.jerk,
-                self.t_elapsed_in_sub,
-            );
-            let delta_dist = dist_new - self.dist_prev;
-            self.dist_prev = dist_new;
-
-            self.set_pos(
-                self.x + delta_dist * seg.direction[0],
-                self.y + delta_dist * seg.direction[1],
-                self.z + delta_dist * seg.direction[2],
-            );
-        } else {
-            // This sub-segment is done; go to next sub-segment or next segment
-            self.next_sub_segment();
-        }
-    }
-
-    fn next_sub_segment(&mut self) {
-        let seg = &self.motion_buffer[self.current_segment];
-
-        if self.current_sub_segment + 1 < seg.sub_segments.len() {
-            self.current_sub_segment += 1;
-        } else {
-            self.current_segment += 1;
-            self.current_sub_segment = 0;
-
-            self.set_pos(
-                seg.end_position[0],
-                seg.end_position[1],
-                seg.end_position[2],
-            );
-        }
-
-        // Reset integration for next sub
-        self.t_elapsed_in_sub = 0.0;
-        self.dist_prev = 0.0;
-    }
-}
-
-fn distance_at_time(v0: f32, a0: f32, j: f32, t: f32) -> f32 {
-    v0 * t + 0.5 * a0 * t * t + (j * t * t * t) / 6.0
-}
-
-/*************************************************
- * S-curve Data Structures
- *************************************************/
-#[derive(Debug, Clone)]
-pub struct ScurveSubSegment {
-    pub jerk: f32,        // jerk, mm/s^3 (constant during this sub-interval)
-    pub accel_start: f32, // acceleration at start of interval
-    pub accel_end: f32,   // acceleration at end of interval
-    pub v_start: f32,     // velocity at start
-    pub v_end: f32,       // velocity at end
-    pub distance: f32,    // distance traveled in this sub-interval (1D)
-    pub t: f32,           // total time for this sub-interval
-}
-
-/// Our "coarse" segment with assigned v_in, v_out
-#[derive(Debug, Clone)]
-pub struct MotionSegment {
-    pub start_position: [f32; 3],
-    pub end_position: [f32; 3],
-    pub distance: f32,       // total 3D distance
-    pub direction: [f32; 3], // normalized direction vector
-    pub feedrate: f32,       // max velocity for this segment
-    pub v_in: f32,           // assigned by multi-pass planning
-    pub v_out: f32,          // assigned by multi-pass planning
-    pub sub_segments: Vec<ScurveSubSegment>,
-}
-
-impl MotionSegment {
-    /// Utility for how much 1D distance we have covered (if you need it for offset calculations).
-    /// For simplicity here, we'll just say it's the sum of sub-segments that have already been popped.
-    pub fn distance_covered(&self) -> f32 {
-        let planned_subs_distance: f32 = self.sub_segments.iter().map(|s| s.distance).sum();
-        self.distance - planned_subs_distance
-    }
-}
-
-/*************************************************
- * Motion Planner
- *************************************************/
-pub struct MotionPlanner;
-
-impl MotionPlanner {
-    pub fn from_program(program: &Vec<Instruction>) -> Vec<MotionSegment> {
-        // 1) Build coarse segments
-        let mut segments = Self::build_coarse_segments(program);
-
-        if segments.is_empty() {
-            return segments;
-        }
-
-        // 2) First forward pass: accelerate from v_in=0
-        segments[0].v_in = 0.0;
-        for i in 0..segments.len() {
-            let seg = &mut segments[i];
-            // v_out^2 = v_in^2 + 2*a*distance
-            let v_allowed =
-                ((seg.v_in * seg.v_in) + 2.0 * DEFAULT_ACCELERATION * seg.distance).sqrt();
-            let v_out = v_allowed.min(seg.feedrate);
-            seg.v_out = v_out;
-
-            // next segment's v_in = seg.v_out
-            if i + 1 < segments.len() {
-                segments[i + 1].v_in = v_out;
-            }
-        }
-
-        // 3) Backward pass
-        for i in (0..segments.len() - 1).rev() {
-            let (cur, nxt) = {
-                let (left, right) = segments.split_at_mut(i + 1);
-                (&mut left[i], &mut right[0])
-            };
-
-            let feasible_v_out =
-                ((cur.v_in * cur.v_in) + 2.0 * DEFAULT_ACCELERATION * cur.distance).sqrt();
-            let new_v_out = cur.v_out.min(feasible_v_out).min(cur.feedrate);
-
-            if new_v_out > nxt.v_in {
-                cur.v_out = nxt.v_in.min(new_v_out);
-            } else {
-                cur.v_out = new_v_out.min(nxt.feedrate);
-            }
-            nxt.v_in = cur.v_out;
-        }
-
-        // 4) second forward pass (optional)
-        for i in 1..segments.len() {
-            segments[i].v_in = segments[i - 1].v_out;
-            let v_allowed = ((segments[i].v_in * segments[i].v_in)
-                + 2.0 * DEFAULT_ACCELERATION * segments[i].distance)
-                .sqrt();
-            let v_out = v_allowed.min(segments[i].feedrate);
-            segments[i].v_out = segments[i].v_out.min(v_out);
-        }
-
-        // 5) Build S-curve sub-segments
-        for seg in segments.iter_mut() {
-            seg.sub_segments = Self::build_scurve_sub_segments(seg);
-        }
-
-        for (i, seg) in segments.iter().enumerate() {
-            println!("Segment #{i}, total dist={:.3}", seg.distance);
-            for (j, s) in seg.sub_segments.iter().enumerate() {
-                println!("  Sub #{j}: t={:.3}, dist={:.3}", s.t, s.distance);
-            }
-        }
-
-        segments
-    }
-
-    fn build_coarse_segments(instructions: &Vec<Instruction>) -> Vec<MotionSegment> {
-        let mut segments = Vec::new();
-        let mut last_pos = [0.0, 0.0, 0.0];
-
-        for instr in instructions {
-            match instr {
-                Instruction::Rapid(feed, inputs) | Instruction::Linear(feed, inputs) => {
-                    let end_pos = [
-                        inputs.x.unwrap_or(last_pos[0]),
-                        inputs.y.unwrap_or(last_pos[1]),
-                        inputs.z.unwrap_or(last_pos[2]),
-                    ];
-                    let d = distance_3d(last_pos, end_pos);
-
-                    let dir = if d > EPSILON {
-                        [
-                            (end_pos[0] - last_pos[0]) / d,
-                            (end_pos[1] - last_pos[1]) / d,
-                            (end_pos[2] - last_pos[2]) / d,
-                        ]
-                    } else {
-                        [0.0, 0.0, 0.0]
-                    };
-
-                    segments.push(MotionSegment {
-                        start_position: last_pos,
-                        end_position: end_pos,
-                        distance: d,
-                        direction: dir,
-                        feedrate: *feed,
-                        v_in: 0.0,
-                        v_out: 0.0,
-                        sub_segments: Vec::new(),
-                    });
-                    last_pos = end_pos;
-                }
-            }
-        }
-        segments
-    }
-
-    /// Build S-curve sub-segments (3-phase approximation).
-    fn build_scurve_sub_segments(seg: &MotionSegment) -> Vec<ScurveSubSegment> {
-        let mut sub_segs = Vec::new();
-
-        if seg.distance < EPSILON {
-            return sub_segs;
-        }
-
-        let v_in = seg.v_in;
-        let v_out = seg.v_out;
-        let v_cruise = seg.feedrate;
-
-        // Possibly won't reach feedrate if distance is short or v_out is lower
-        let v_peak = v_cruise.max(v_in).max(v_out);
-
-        let t_acc = (v_peak - v_in) / DEFAULT_ACCELERATION;
-        let t_dec = (v_peak - v_out) / DEFAULT_ACCELERATION;
-
-        let d_acc = 0.5 * (v_in + v_peak) * t_acc;
-        let d_dec = 0.5 * (v_peak + v_out) * t_dec;
-
-        let d_total_needed = d_acc + d_dec;
-        let d_cruise = if d_total_needed < seg.distance {
-            seg.distance - d_total_needed
+        // remaining distance for cruise (phase 2)
+        let d_cruise = if distance > (d_acc + d_dec) {
+            distance - (d_acc + d_dec)
         } else {
             0.0
         };
 
-        // --- Sub #1: accelerate ---
-        if t_acc > EPSILON {
-            // jerk = (a_final - a_start)/time, here a_start=0, a_final=accel
-            // but let’s just say a_final=+ACCEL => j=ACCEL/t_acc
-            let j = (DEFAULT_ACCELERATION - 0.0) / t_acc;
-            sub_segs.push(ScurveSubSegment {
-                jerk: j,
-                accel_start: 0.0,
-                accel_end: DEFAULT_ACCELERATION,
-                v_start: v_in,
-                v_end: v_peak,
-                distance: d_acc,
-                t: t_acc,
-            });
+        // time at cruise speed (phase 2)
+        let t2 = if v_max > 1e-6 { d_cruise / v_max } else { 0.0 };
+
+        let t_total = t1 + t2 + t3;
+
+        // 2) We'll do Euler steps from t=0..t_total
+        let mut t = 0.0;
+        let mut velocity = v_in;
+        let mut accel = 0.0;
+
+        // We'll track how far we've traveled along the segment in 1D
+        let mut dist_covered = 0.0;
+
+        // For convenience, store local references
+        let (sx, sy, sz) = (
+            segment.start_position[0],
+            segment.start_position[1],
+            segment.start_position[2],
+        );
+        let dir = segment.direction;
+
+        while t < t_total {
+            // figure out which phase
+            match t {
+                t_ph if t_ph < t1 => {
+                    // accelerate
+                    accel = a_max;
+                }
+                t_ph if t_ph < (t1 + t2) => {
+                    // cruise
+                    accel = 0.0;
+                    velocity = v_max; // clamp to v_max
+                }
+                _ => {
+                    // decelerate
+                    accel = -a_max;
+                }
+            }
+
+            // Apply acceleration for this dt
+            let old_vel = velocity;
+            velocity += accel * dt;
+
+            // clamp velocity to [0, v_max] if you want
+            if velocity > v_max {
+                velocity = v_max;
+            }
+            if velocity < 0.0 {
+                velocity = 0.0;
+            }
+
+            // average velocity this step
+            let vel_avg = 0.5 * (old_vel + velocity);
+
+            // distance traveled in this step
+            let dist_step = vel_avg * dt;
+            dist_covered += dist_step;
+
+            // but don't exceed total distance
+            if dist_covered > distance {
+                dist_covered = distance;
+            }
+
+            // update machine position
+            self.x = sx + dir[0] * dist_covered;
+            self.y = sy + dir[1] * dist_covered;
+            self.z = sz + dir[2] * dist_covered;
+
+            // print or log
+            println!(
+                "t={:.3}: x={:.2}, y={:.2}, z={:.2}, dist={:.2}, vel={:.2}, accel={:.2}",
+                t, self.x, self.y, self.z, dist_covered, velocity, accel
+            );
+
+            // break if we've reached the distance
+            if (distance - dist_covered).abs() < 1e-6 {
+                break;
+            }
+
+            // increment time
+            t += dt;
+            sleep(Duration::from_secs_f32(dt)).await;
         }
 
-        // --- Sub #2: cruise ---
-        if d_cruise > EPSILON && v_peak > EPSILON {
-            let t_cruise = d_cruise / v_peak;
-            sub_segs.push(ScurveSubSegment {
-                jerk: 0.0,
-                accel_start: 0.0,
-                accel_end: 0.0,
-                v_start: v_peak,
-                v_end: v_peak,
-                distance: d_cruise,
-                t: t_cruise,
-            });
-        }
-
-        // --- Sub #3: decelerate ---
-        if t_dec > EPSILON {
-            let j = (0.0 - DEFAULT_ACCELERATION) / t_dec;
-            sub_segs.push(ScurveSubSegment {
-                jerk: j,
-                accel_start: 0.0,
-                accel_end: -DEFAULT_ACCELERATION,
-                v_start: v_peak,
-                v_end: v_out,
-                distance: d_dec,
-                t: t_dec,
-            });
-        }
-
-        sub_segs
+        // clamp final position
+        self.x = segment.end_position[0];
+        self.y = segment.end_position[1];
+        self.z = segment.end_position[2];
     }
-}
 
-/*************************************************
- * Utilities
- *************************************************/
-fn distance_3d(a: [f32; 3], b: [f32; 3]) -> f32 {
-    ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2) + (b[2] - a[2]).powi(2)).sqrt()
+    pub fn queue_motion(&mut self, motions: Vec<Movement>) {
+        for motion in motions {
+            match motion {
+                Movement::Linear { feedrate, coords } => {
+                    self.update_previous_segment_vout(feedrate);
+
+                    let segment = self.build_linear_segment(feedrate, coords);
+
+                    // self.apply_corner_slowdown(&segment);
+
+                    self.motion_buffer.push(segment);
+                }
+                Movement::Rapid(_) => {
+                    // If you want to handle rapids differently, do it here
+                }
+            }
+        }
+    }
+
+    /// Helper that builds a new MotionSegment from a feedrate + target coords
+    fn build_linear_segment(&self, feedrate: f32, coords: Coordinates) -> MotionSegment {
+        // Where the new segment starts:
+        let (start_x, start_y, start_z) = if let Some(prev) = self.motion_buffer.last() {
+            (
+                prev.end_position[0],
+                prev.end_position[1],
+                prev.end_position[2],
+            )
+        } else {
+            (self.x, self.y, self.z)
+        };
+
+        let start_position = [start_x, start_y, start_z];
+
+        // Where the new segment ends:
+        let end_x = coords.x.unwrap_or(self.x);
+        let end_y = coords.y.unwrap_or(self.y);
+        let end_z = coords.z.unwrap_or(self.z);
+
+        let end_position = [end_x, end_y, end_z];
+
+        // Compute distance + direction
+        let dx = end_x - start_x;
+        let dy = end_y - start_y;
+        let dz = end_z - start_z;
+        let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+
+        // Avoid divide-by-zero if coords are the same
+        let direction = if distance > 1e-9 {
+            [dx / distance, dy / distance, dz / distance]
+        } else {
+            [0.0, 0.0, 0.0]
+        };
+
+        let v_in = if let Some(prev) = self.motion_buffer.last() {
+            prev.v_out
+        } else {
+            0.0
+        };
+
+        let v_out = 0.0; // will be updated later
+
+        MotionSegment {
+            start_position,
+            end_position,
+            distance,
+            direction,
+            v_max: feedrate,
+            v_in,
+            v_out,
+        }
+    }
+
+    fn update_previous_segment_vout(&mut self, new_v_in: f32) {
+        if let Some(prev_segment) = self.motion_buffer.last_mut() {
+            prev_segment.v_out = new_v_in;
+        }
+    }
+
+    fn apply_corner_slowdown(&mut self, new_seg: &MotionSegment) {
+        let mut angle_sum = 0.0;
+        let mut accumulated_distance = 0.0;
+        let mut last_straight = None;
+
+        for seg in self.motion_buffer.iter_mut().rev() {
+            let dot = seg.direction[0] * new_seg.direction[0]
+                + seg.direction[1] * new_seg.direction[1]
+                + seg.direction[2] * new_seg.direction[2];
+
+            let cos_angle = dot.clamp(-1.0, 1.0);
+            let angle = cos_angle.acos(); // radians
+
+            if angle.to_degrees() < 10.0 {
+                // "Straight" motion, accumulate distance
+                accumulated_distance += seg.distance;
+                last_straight = Some(seg);
+            } else {
+                // Reset accumulated distance on sharp turns
+                accumulated_distance = 0.0;
+                angle_sum += angle;
+            }
+
+            // Stop accumulating if total angle exceeds threshold
+            if let Some(last_straight) = &last_straight {
+                let slowdown_distance = (last_straight.v_out * last_straight.v_out)
+                    / (2.0 * self.settings.max_acceleration);
+
+                if angle_sum.to_degrees() > 45.0 || accumulated_distance > slowdown_distance {
+                    break;
+                }
+            }
+        }
+
+        if let Some(last_straight) = last_straight {
+            last_straight.v_out *= 0.5;
+        }
+    }
+
+    pub async fn tick(&mut self) {
+        if self.motion_buffer.is_empty() {
+            return;
+        }
+
+        let segment = self.motion_buffer.remove(0);
+
+        self.move_to(segment).await;
+    }
 }

@@ -1,60 +1,53 @@
 use std::time::Duration;
 
-use cnc_brain::runner::{Instruction, MachineState, MotionInputs, MotionPlanner, MotionSegment};
+use cnc_brain::{runner::MachineState, Coordinates, Movement};
 use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() {
-    let program = MotionPlanner::from_program(&vec![
-        Instruction::Linear(
-            50.0,
-            MotionInputs {
-                x: Some(100.0),
-                y: Some(100.0),
+    let program = &vec![
+        Movement::Linear {
+            feedrate: 100.0,
+            coords: Coordinates {
+                x: Some(150.0),
+                y: Some(150.0),
                 z: Some(0.0),
             },
-        ),
-        Instruction::Linear(
-            100.0,
-            MotionInputs {
-                x: Some(100.0),
-                y: Some(200.0),
+        },
+        Movement::Linear {
+            feedrate: 100.0,
+            coords: Coordinates {
+                x: Some(175.0),
+                y: Some(250.0),
                 z: Some(0.0),
             },
-        ),
-        Instruction::Linear(
-            20.0,
-            MotionInputs {
-                x: Some(0.0),
-                y: Some(200.0),
-                z: Some(0.0),
-            },
-        ),
-    ]);
+        },
+    ];
 
-    return;
+    // println!("{:#?}", program);
+    // return;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-    tx.send(Command::PushMotions(program)).await.unwrap();
+    tx.send(Command::Movement(program.clone())).await.unwrap();
 
     let mut machine = MachineState::default();
     loop {
         if let Ok(command) = rx.try_recv() {
             match command {
-                Command::PushMotions(motions) => {
-                    machine.push_motions(motions);
+                Command::Movement(movement) => {
+                    machine.queue_motion(movement);
                 }
             }
         }
 
-        machine.step().await;
+        machine.tick().await;
 
-        sleep(Duration::from_millis(1)).await;
+        sleep(Duration::from_millis(50)).await;
     }
 }
 
 #[derive(Debug)]
 enum Command {
-    PushMotions(Vec<MotionSegment>),
+    Movement(Vec<Movement>),
 }
