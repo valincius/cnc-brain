@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use cnc_brain::{runner::MachineState, Coordinates, Movement};
+use cnc_brain::{runner::MachineState, Coordinates, Motion};
 use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() {
     let program = &vec![
-        Movement::Linear {
+        Motion::Linear {
             feedrate: 100.0,
             coords: Coordinates {
                 x: Some(150.0),
@@ -14,7 +14,7 @@ async fn main() {
                 z: Some(0.0),
             },
         },
-        Movement::Linear {
+        Motion::Linear {
             feedrate: 100.0,
             coords: Coordinates {
                 x: Some(158.0),
@@ -22,11 +22,35 @@ async fn main() {
                 z: Some(0.0),
             },
         },
-        Movement::Linear {
+        Motion::Linear {
             feedrate: 100.0,
             coords: Coordinates {
                 x: Some(200.0),
                 y: Some(253.0),
+                z: Some(0.0),
+            },
+        },
+        Motion::Linear {
+            feedrate: 100.0,
+            coords: Coordinates {
+                x: Some(200.0),
+                y: Some(260.0),
+                z: Some(0.0),
+            },
+        },
+        Motion::Linear {
+            feedrate: 100.0,
+            coords: Coordinates {
+                x: Some(200.0),
+                y: Some(275.0),
+                z: Some(0.0),
+            },
+        },
+        Motion::Linear {
+            feedrate: 100.0,
+            coords: Coordinates {
+                x: Some(220.0),
+                y: Some(280.0),
                 z: Some(0.0),
             },
         },
@@ -57,5 +81,5 @@ async fn main() {
 
 #[derive(Debug)]
 enum Command {
-    Movement(Vec<Movement>),
+    Movement(Vec<Motion>),
 }

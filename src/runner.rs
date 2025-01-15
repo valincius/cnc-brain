@@ -2,7 +2,7 @@ use std::{sync::LazyLock, time::Duration};
 
 use tokio::time::sleep;
 
-use crate::{Coordinates, MotionSegment, Movement};
+use crate::Motion;
 
 #[derive(Debug)]
 pub struct MachineSettings {
@@ -29,124 +29,131 @@ impl Default for MachineSettings {
 
 static DEFAULT_SETTINGS: LazyLock<MachineSettings> = LazyLock::new(MachineSettings::default);
 
+#[derive(Debug, Clone)]
+pub struct MotionSegment {
+    pub start_position: [f32; 3],
+    pub end_position: [f32; 3],
+    pub distance: f32,
+    pub direction: [f32; 3],
+    pub v_max: f32,
+    pub v_in: f32,
+    pub v_out: f32,
+}
+
 #[derive(Debug, Default)]
-pub struct MotionBuffer(Vec<MotionSegment>);
+pub struct MotionBuffer {
+    buffer: Vec<MotionSegment>,
+
+    weighted_queue_vector: [f32; 3],
+}
 
 impl MotionBuffer {
-    pub fn push(&mut self, mut segment: MotionSegment) {
-        if let Some(prev) = self.0.last_mut() {
-            // Set the new segment's `v_in` to the previous segment's `v_out`
-            segment.v_in = prev.v_out;
+    pub fn queue(&mut self, motion: Motion) {
+        let mut new_segment = self.create_segment(motion);
 
-            // Temporarily calculate the previous segment's `v_out` based on the new segment
-            prev.v_out = segment.v_max;
+        if let Some(prev) = self.buffer.last_mut() {
+            prev.v_out = new_segment.v_max;
+            new_segment.v_in = prev.v_out;
+
+            // "nudge" the weighted queue vector
+
+            // 1) Compute the direction of the new segment
+            let new_dir = normalize(&[
+                new_segment.end_position[0] - new_segment.start_position[0],
+                new_segment.end_position[1] - new_segment.start_position[1],
+                new_segment.end_position[2] - new_segment.start_position[2],
+            ]);
+
+            // 2) Compute the angle between the new segment and the previous segment
+            let angle = (new_dir[0] * prev.direction[0]
+                + new_dir[1] * prev.direction[1]
+                + new_dir[2] * prev.direction[2])
+                .acos()
+                .to_degrees();
+
+            // 3) Compute the weight of the new segment
+            let weight = 1.0 - (angle / DEFAULT_SETTINGS.max_angle_threshold).min(1.0);
+
+            // 4) Update the weighted queue vector
+            self.weighted_queue_vector[0] += new_dir[0] * weight;
+            self.weighted_queue_vector[1] += new_dir[1] * weight;
+            self.weighted_queue_vector[2] += new_dir[2] * weight;
+
+            // 5) Normalize the weighted queue vector
+            let magnitude = (self.weighted_queue_vector[0].powi(2)
+                + self.weighted_queue_vector[1].powi(2)
+                + self.weighted_queue_vector[2].powi(2))
+            .sqrt();
+
+            self.weighted_queue_vector[0] /= magnitude;
+            self.weighted_queue_vector[1] /= magnitude;
+            self.weighted_queue_vector[2] /= magnitude;
+
+            // 6) Compute the angle between the weighted queue vector and the new segment
+            let angle = (new_dir[0] * self.weighted_queue_vector[0]
+                + new_dir[1] * self.weighted_queue_vector[1]
+                + new_dir[2] * self.weighted_queue_vector[2])
+                .acos()
+                .to_degrees();
+
+            // print out all the variables
+
+            println!("new_dir: {:?}, prev_dir: {:?}, angle: {:.2}, weight: {:.2}, weighted_queue_vector: {:?}, angle_weighted: {:.2}", new_dir, prev.direction, angle, weight, self.weighted_queue_vector, angle);
         }
 
-        // Apply slowdown logic
-        self.apply_corner_slowdown(&segment);
-
-        // Ensure the previous segment's `v_out` is correctly updated after slowdown
-        if let Some(prev) = self.0.last_mut() {
-            prev.v_out = segment.v_in;
-        }
-
-        self.0.push(segment);
+        self.buffer.push(new_segment);
     }
 
-    pub fn pop(&mut self) -> Option<MotionSegment> {
-        if self.0.is_empty() {
+    pub fn dequeue(&mut self) -> Option<MotionSegment> {
+        if self.buffer.is_empty() {
             None
         } else {
-            Some(self.0.remove(0))
+            Some(self.buffer.remove(0))
         }
     }
 
-    pub fn last(&self) -> Option<&MotionSegment> {
-        self.0.last()
-    }
+    fn create_segment(&self, motion: Motion) -> MotionSegment {
+        let prev_segment = self.buffer.last();
 
-    pub fn update_vout_and_propogate_forward(&mut self, idx: usize, v_out: f32) {
-        let len = self.0.len();
-        if idx >= len {
-            return;
-        }
+        match motion {
+            Motion::Linear { feedrate, coords } => {
+                let start = if let Some(prev) = prev_segment {
+                    prev.end_position
+                } else {
+                    [0.0, 0.0, 0.0]
+                };
 
-        // Update the current segment's v_out
-        self.0[idx].v_out = v_out;
+                let end = [
+                    coords.x.unwrap_or(start[0]),
+                    coords.y.unwrap_or(start[1]),
+                    coords.z.unwrap_or(start[2]),
+                ];
 
-        if idx + 1 < len {
-            // Calculate the maximum allowed v_in for the next segment
-            let v_max_next = self.0[idx + 1].v_max;
-            let v_in = ((v_out * v_out) + (v_max_next * v_max_next))
-                / (2.0 * DEFAULT_SETTINGS.max_acceleration);
+                let distance = ((end[0] - start[0]).powi(2)
+                    + (end[1] - start[1]).powi(2)
+                    + (end[2] - start[2]).powi(2))
+                .sqrt();
 
-            // Ensure the next segment's v_in respects the constraints
-            let v_in_clamped = v_in.min(v_max_next);
+                let direction =
+                    normalize(&[end[0] - start[0], end[1] - start[1], end[2] - start[2]]);
 
-            // Recursively propagate the velocity
-            self.update_vout_and_propogate_forward(idx + 1, v_in_clamped);
+                let v_max = feedrate;
+                let v_in = 0.0;
+                let v_out = 0.0;
 
-            println!(
-                "Updating idx: {}, new v_out: {:.2}, new v_in: {:.2}",
-                idx, v_out, v_in
-            );
-        }
-    }
-
-    pub fn apply_corner_slowdown(&mut self, new_seg: &MotionSegment) {
-        let mut angle_sum: f32 = 0.0;
-        let mut accumulated_distance = 0.0;
-        let mut last_straight = None;
-        let mut last_straight_idx = 0;
-        let len = self.0.len();
-
-        for (i, seg) in self.0.iter_mut().rev().enumerate() {
-            let idx = len - 1 - i; // Convert reversed index to original index
-
-            // Compute angle between segments
-            let dot = seg
-                .direction
-                .iter()
-                .zip(new_seg.direction.iter())
-                .map(|(a, b)| a * b)
-                .sum::<f32>();
-            let cos_angle = dot.clamp(-1.0, 1.0);
-            let angle = cos_angle.acos(); // Radians
-
-            if angle.to_degrees() < DEFAULT_SETTINGS.straight_angle_threshold {
-                // "Straight" motion
-                accumulated_distance += seg.distance;
-                last_straight = Some(seg);
-                last_straight_idx = idx;
-            } else {
-                // Sharp turn detected, reset distance
-                accumulated_distance = 0.0;
-                angle_sum += angle;
-            }
-
-            // Break if angle exceeds the threshold or distance is sufficient for slowdown
-            if let Some(last_straight) = &last_straight {
-                let slowdown_distance = (last_straight.v_out * last_straight.v_out)
-                    / (2.0 * DEFAULT_SETTINGS.max_acceleration);
-
-                if angle_sum.to_degrees() > DEFAULT_SETTINGS.max_angle_threshold
-                    || accumulated_distance > slowdown_distance
-                {
-                    break;
+                MotionSegment {
+                    start_position: start,
+                    end_position: end,
+                    distance,
+                    direction,
+                    v_max,
+                    v_in,
+                    v_out,
                 }
             }
-        }
-
-        // Apply slowdown at the last straight segment
-        if let Some(last_straight) = last_straight {
-            let v_out = last_straight.v_out * DEFAULT_SETTINGS.slowdown_factor;
-
-            println!(
-                "Segment idx: {}, angle_sum: {:.2}, accumulated_distance: {:.2}, v_out: {:.2}, v_in: {:.2}",
-                last_straight_idx, angle_sum.to_degrees(), accumulated_distance, last_straight.v_out, last_straight.v_in
-            );
-
-            self.update_vout_and_propogate_forward(last_straight_idx, v_out);
+            Motion::Rapid(_coords) => {
+                todo!()
+            }
         }
     }
 }
@@ -287,69 +294,14 @@ impl MachineState {
         self.z = segment.end_position[2];
     }
 
-    pub fn queue_motion(&mut self, motions: Vec<Movement>) {
+    pub fn queue_motion(&mut self, motions: Vec<Motion>) {
         for motion in motions {
-            match motion {
-                Movement::Linear { feedrate, coords } => {
-                    let segment = self.build_linear_segment(feedrate, coords);
-
-                    self.motion_buffer.push(segment);
-                }
-                Movement::Rapid(_) => {
-                    // If you want to handle rapids differently, do it here
-                }
-            }
-        }
-    }
-
-    /// Helper that builds a new MotionSegment from a feedrate + target coords
-    fn build_linear_segment(&self, feedrate: f32, coords: Coordinates) -> MotionSegment {
-        // Where the new segment starts:
-        let (start_x, start_y, start_z) = if let Some(prev) = self.motion_buffer.last() {
-            (
-                prev.end_position[0],
-                prev.end_position[1],
-                prev.end_position[2],
-            )
-        } else {
-            (self.x, self.y, self.z)
-        };
-
-        let start_position = [start_x, start_y, start_z];
-
-        // Where the new segment ends:
-        let end_x = coords.x.unwrap_or(self.x);
-        let end_y = coords.y.unwrap_or(self.y);
-        let end_z = coords.z.unwrap_or(self.z);
-
-        let end_position = [end_x, end_y, end_z];
-
-        // Compute distance + direction
-        let dx = end_x - start_x;
-        let dy = end_y - start_y;
-        let dz = end_z - start_z;
-        let distance = (dx * dx + dy * dy + dz * dz).sqrt();
-
-        // Avoid divide-by-zero if coords are the same
-        let direction = if distance > 1e-9 {
-            [dx / distance, dy / distance, dz / distance]
-        } else {
-            [0.0, 0.0, 0.0]
-        };
-
-        MotionSegment {
-            start_position,
-            end_position,
-            distance,
-            direction: normalize(&direction),
-            v_max: feedrate,
-            v_in: feedrate,
-            v_out: feedrate,
+            self.motion_buffer.queue(motion);
         }
     }
 
     pub async fn tick(&mut self) {
-        if let Some(segment) = self.motion_buffer.pop() {
+        if let Some(segment) = self.motion_buffer.dequeue() {
             self.move_to(segment).await;
         }
     }
