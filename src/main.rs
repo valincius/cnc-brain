@@ -17,8 +17,16 @@ async fn main() {
         Movement::Linear {
             feedrate: 100.0,
             coords: Coordinates {
-                x: Some(175.0),
-                y: Some(250.0),
+                x: Some(158.0),
+                y: Some(253.0),
+                z: Some(0.0),
+            },
+        },
+        Movement::Linear {
+            feedrate: 100.0,
+            coords: Coordinates {
+                x: Some(200.0),
+                y: Some(253.0),
                 z: Some(0.0),
             },
         },
