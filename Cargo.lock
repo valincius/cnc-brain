@@ -148,6 +148,7 @@ dependencies = [
  "embedded-storage",
  "fixed",
  "fixed-macro",
+ "heapless",
  "log",
  "panic-probe",
  "pio",
