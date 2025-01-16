@@ -1,4 +1,5 @@
 pub mod runner;
+pub mod stepper;
 
 #[derive(Debug, Default, Copy, Clone)]
 pub struct Coordinates {

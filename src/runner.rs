@@ -212,7 +212,6 @@ impl MachineState {
         // 2) We'll do Euler steps from t=0..t_total
         let mut t = 0.0;
         let mut velocity = v_in;
-        let mut accel = 0.0;
 
         // We'll track how far we've traveled along the segment in 1D
         let mut dist_covered = 0.0;
@@ -225,6 +224,7 @@ impl MachineState {
         );
         let dir = segment.direction;
 
+        let mut accel = 0.0;
         while t < t_total {
             // figure out which phase
             match t {
