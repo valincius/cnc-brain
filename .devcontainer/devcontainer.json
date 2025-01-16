@@ -4,10 +4,6 @@
 	"name": "Rust",
 	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
 	"image": "mcr.microsoft.com/devcontainers/rust:1-1-bullseye",
-	"features": {
-		"devwasm.azurecr.io/dev-wasm/dev-wasm-feature/rust-wasi:0": {}
-	}
-
 	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
 	// "mounts": [
 	// 	{
@@ -16,19 +12,14 @@
 	// 		"type": "volume"
 	// 	}
 	// ]
-
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	// "features": {},
-
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	// "forwardPorts": [],
-
 	// Use 'postCreateCommand' to run commands after the container is created.
-	// "postCreateCommand": "rustc --version",
-
+	"postCreateCommand": "rustup self update && rustup update stable && rustup target add thumbv6m-none-eabi && sudo apt update && sudo apt upgrade -y && sudo apt install -y libudev-dev && cargo install elf2uf2-rs --locked "
 	// Configure tool-specific properties.
 	// "customizations": {},
-
 	// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
 	// "remoteUser": "root"
 }
