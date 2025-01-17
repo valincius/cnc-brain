@@ -1,6 +1,8 @@
 mod servo;
 mod stepper;
 
+use core::future::Future;
+
 pub use servo::ServoDrive;
 pub use stepper::StepperDrive;
 
@@ -10,7 +12,11 @@ use embassy_time::Duration;
 pub trait Motor {}
 
 pub trait PositionalMotor {
-    async fn move_over_time(&mut self, position: Fixed32, duration: Duration);
+    fn move_over_time(
+        &mut self,
+        position: Fixed32,
+        duration: Duration,
+    ) -> impl Future<Output = ()> + Send;
     fn get_position(&self) -> Fixed32;
 }
 
