@@ -45,7 +45,8 @@ embedded-storage = { version = "0.3" }
 static_cell = "2.1"
 portable-atomic = { version = "1.5", features = ["critical-section"] }
 log = "0.4"
-pio-proc = { version = "0.2" }
-pio = { version = "0.2" }
+pio-proc = "0.2"
+pio = "0.2"
 rand = { version = "0.8.5", default-features = false }
 heapless = "0.8.0"
+micromath = "2.1.0"

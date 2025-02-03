@@ -1,9 +1,7 @@
-mod servo;
 mod stepper;
 
 use core::future::Future;
 
-pub use servo::ServoDrive;
 pub use stepper::StepperDrive;
 
 use crate::Fixed32;
