@@ -1,13 +1,7 @@
-// This PIO program repeatedly:
-// 1) Pull a value from the TX FIFO (the "period" in PIO cycles).
-// 2) Drive STEP pin high briefly, then low.
-// 3) Delay for "period" cycles.
-// 4) Loop.
-
 .program stepper_program
 
 .wrap_target
-    pull block
+    pull noblock
     mov y, osr
 
     set pins, 1

@@ -8,13 +8,16 @@ use embassy_executor::Spawner;
 use embassy_rp::{
     bind_interrupts,
     gpio::{Level, Output},
-    peripherals::USB,
+    peripherals::{PIO0, USB},
+    pio::Pio,
     rom_data::reset_to_usb_boot,
-    usb::{Driver, InterruptHandler},
+    usb::Driver,
+    Peripheral,
 };
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel};
 use embassy_time::{Duration, Instant, Timer};
 use embassy_usb_logger::ReceiverHandler;
+use fixed::traits::ToFixed;
 use heapless::Vec;
 use micromath::F32Ext;
 use portable_atomic::AtomicU64;
@@ -29,8 +32,13 @@ static CHANNEL: embassy_sync::channel::Channel<
 > = Channel::new();
 
 pub enum Command {
-    Speed(u64),
+    Speed(u32),
 }
+
+bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
+    USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
+});
 
 // const DEFAULT_ACCEL_MAX: f32 = 300.0; // mm/s^2
 // const DEFAULT_JERK_MAX: f32 = 1000.0; // mm/s^3 (if implementing jerk control)
@@ -48,120 +56,99 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(p.USB, Irqs);
     spawner.spawn(logger_task(driver)).unwrap();
 
-    spawner.spawn(stepper_task()).unwrap();
+    spawner.spawn(accel_task()).unwrap();
 
     let mut led = Output::new(p.PIN_25, Level::Low);
     led.set_high();
 
-    let mut step_pin = Output::new(p.PIN_0, Level::Low);
     let mut dir_pin = Output::new(p.PIN_1, Level::Low);
 
-    let mut pio = Pio::new(pio);
-    let sm = pio.sm0();
+    let Pio {
+        mut common,
+        mut sm0,
+        ..
+    } = Pio::new(p.PIO0, Irqs);
 
-    let program = pio_proc::pio_asm!(
-        ".wrap_target",
-        "pull block",
-        "mov x, osr",
-        "loop:",
-        "pull noblock",
-        "mov x, osr",
-        "mov y, isr",
-        "jmp y==x, wait_delay",
-        "jmp y<x, increase_speed",
-        "jmp decrease_speed",
-        "increase_speed:",
-        "add y, 1",
-        "jmp wait_delay",
-        "decrease_speed:",
-        "sub y, 1",
-        "jmp wait_delay",
-        "wait_delay:",
-        "mov z, y",
-        "delay_loop:",
-        "jmp z--, delay_loop",
-        "mov osr, y",
-        "out pins, 1 [1]",
-        "out pins, 0 [1]",
-        "jmp loop",
-        ".wrap"
-    );
+    let step_pin = common.make_pio_pin(p.PIN_0);
 
-    let installed = pio.install(&program.program).unwrap();
+    let program = pio_proc::pio_file!("./src/prog.pio");
 
-    let mut cfg = Config::default();
-    cfg.set_out_pins(&[step_pin.pin()]);
-    cfg.set_set_pins(&[step_pin.pin()]);
-    cfg.clock_divider = 1.0;
-    sm.set_config(&cfg);
-    sm.set_pindirs(0b1);
-
-    sm.set_enabled(true);
-
-    let mut dma_buffer = [0u32; 1];
+    let mut cfg = embassy_rp::pio::Config::default();
+    cfg.use_program(&common.load_program(&program.program), &[]);
+    cfg.set_out_pins(&[&step_pin]);
+    cfg.set_set_pins(&[&step_pin]);
+    sm0.set_config(&cfg);
+    sm0.set_enable(true);
 
     loop {
-        let target_speed = STEP_TARGET_SPEED.load(Ordering::Relaxed);
-
-        dma_buffer[0] = target_speed;
-
-        dma.start();
-
-        Timer::after(Duration::from_millis(1)).await;
+        match CHANNEL.receive().await {
+            Command::Speed(speed) => {
+                sm0.tx().wait_push(speed).await;
+            }
+        }
     }
 }
 
 #[embassy_executor::task]
-async fn stepper_task() {
-    let mut current_speed: u64 = 0; // Steps per second
-    let mut target_speed: u64 = 0; // Steps per second
+async fn accel_task() {
+    let target_pos = 50_000u32;
+    let mut current_pos = 0u32; // in steps
+    let mut current_speed = 0u32; // steps/sec
+    let max_speed = 20_000u32; // steps/sec (example)
+    let accel = 10_000u32; // steps/sec^2
+    let dt = 0.001; // 1 ms loop time
 
-    let mut last_update = Instant::now(); // Track time
+    let mut position_f = 0.0; // keep in float
+
+    let mut last_update = Instant::now();
 
     loop {
         let now = Instant::now();
-        let dt = (now.duration_since(last_update).as_millis() as f32) / 1000.0; // Time in seconds
+        let dt = now.duration_since(last_update).as_millis() as f32 / 1000.0;
         last_update = now;
 
-        log::info!("Current Speed: {} steps/sec", current_speed);
+        let distance_to_go = target_pos - current_pos;
+        if distance_to_go == 0 {
+            // Done or overshot
+            current_speed = 0;
+            current_pos = target_pos;
+            CHANNEL.send(Command::Speed(0)).await;
+            break;
+        }
 
-        if let Ok(cmd) = CHANNEL.try_receive() {
-            match cmd {
-                Command::Speed(speed) => {
-                    target_speed = speed.min(MAX_STEP_FREQUENCY); // Cap at max frequency
+        let decel_distance = (current_speed as f32).powi(2) / (2.0 * accel as f32);
+        if decel_distance >= distance_to_go as f32 {
+            // decelerate
+            let decel = (accel as f32 * dt) as u32;
+            if decel > current_speed {
+                current_speed = 0;
+            } else {
+                current_speed -= decel;
+            }
+        } else {
+            // accelerate or cruise
+            if current_speed < max_speed {
+                current_speed += (accel as f32 * dt) as u32;
+                if current_speed > max_speed {
+                    current_speed = max_speed;
                 }
             }
         }
 
-        // Compute acceleration step
-        let acceleration_step = (ACCELERATION as f32 * dt).max(1.0) as u64;
+        // Compute how many steps we move in this time slice
+        let delta = current_speed as f32 * dt;
+        position_f += delta;
+        let whole_steps = position_f.floor() as u32;
+        position_f -= whole_steps as f32;
+        current_pos += whole_steps;
 
-        // Apply acceleration linearly
-        if current_speed < target_speed {
-            current_speed += acceleration_step;
-            current_speed = current_speed.min(target_speed);
-        } else if current_speed > target_speed {
-            current_speed = current_speed.saturating_sub(acceleration_step);
-            current_speed = current_speed.max(target_speed);
-        }
+        // Send integer speed to PIO
+        let _ = CHANNEL.try_send(Command::Speed(current_speed));
 
-        // Calculate step delay time in nanoseconds
-        let step_delay = if current_speed > 0 {
-            NANOSECONDS_PER_SECOND / current_speed
-        } else {
-            0
-        };
-
-        DELAY_NS.store(step_delay, Ordering::Relaxed);
-
-        // Small delay to let other tasks run
+        // Wait dt
         Timer::after(Duration::from_millis(1)).await;
     }
 }
-
-bind_interrupts!(struct Irqs {
-    USBCTRL_IRQ => InterruptHandler<USB>;
-});
 
 struct Handler;
 
@@ -175,7 +162,7 @@ impl ReceiverHandler for Handler {
                 match cmd {
                     "speed" => {
                         if let Some(speed) = parts.next() {
-                            if let Ok(speed) = speed.parse::<u64>() {
+                            if let Ok(speed) = speed.parse::<u32>() {
                                 CHANNEL.send(Command::Speed(speed)).await;
                             }
                         }
