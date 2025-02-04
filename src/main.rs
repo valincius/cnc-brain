@@ -1,73 +1,255 @@
 #![no_std]
 #![no_main]
 
-use cnc_brain::prelude::*;
+use core::str;
+use core::sync::atomic::Ordering;
 
 use embassy_executor::Spawner;
-use embassy_rp::gpio::{Level, Output};
-use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Timer};
+use embassy_rp::{
+    bind_interrupts,
+    gpio::{Level, Output},
+    peripherals::USB,
+    rom_data::reset_to_usb_boot,
+    usb::{Driver, InterruptHandler},
+};
+use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel};
+use embassy_time::{Duration, Instant, Timer};
+use embassy_usb_logger::ReceiverHandler;
 use heapless::Vec;
 use micromath::F32Ext;
+use portable_atomic::AtomicU64;
 use {defmt_rtt as _, panic_probe as _};
 
-static CHANNEL: CommandChannel = Channel::new();
+const CHANNEL_BUFFER_CAPACITY: usize = 64;
 
-const DEFAULT_ACCEL_MAX: f32 = 300.0; // mm/s^2
-const DEFAULT_JERK_MAX: f32 = 1000.0; // mm/s^3 (if implementing jerk control)
+static CHANNEL: embassy_sync::channel::Channel<
+    ThreadModeRawMutex,
+    Command,
+    CHANNEL_BUFFER_CAPACITY,
+> = Channel::new();
+
+pub enum Command {
+    Speed(u64),
+}
+
+// const DEFAULT_ACCEL_MAX: f32 = 300.0; // mm/s^2
+// const DEFAULT_JERK_MAX: f32 = 1000.0; // mm/s^3 (if implementing jerk control)
+
+static DELAY_NS: AtomicU64 = AtomicU64::new(0);
+
+const MAX_STEP_FREQUENCY: u64 = 400_000; // Maximum step frequency in Hz
+const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
+const ACCELERATION: u64 = 50_000; // Steps per second² (tunable)
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    let program_with_defines = pio_proc::pio_file!(
-        "./src/prog.pio",
-        select_program("stepper_program"), // Optional if only one program in the file
+    let driver = Driver::new(p.USB, Irqs);
+    spawner.spawn(logger_task(driver)).unwrap();
+
+    spawner.spawn(stepper_task()).unwrap();
+
+    let mut led = Output::new(p.PIN_25, Level::Low);
+    led.set_high();
+
+    let mut step_pin = Output::new(p.PIN_0, Level::Low);
+    let mut dir_pin = Output::new(p.PIN_1, Level::Low);
+
+    let mut pio = Pio::new(pio);
+    let sm = pio.sm0();
+
+    let program = pio_proc::pio_asm!(
+        ".wrap_target",
+        "pull block",
+        "mov x, osr",
+        "loop:",
+        "pull noblock",
+        "mov x, osr",
+        "mov y, isr",
+        "jmp y==x, wait_delay",
+        "jmp y<x, increase_speed",
+        "jmp decrease_speed",
+        "increase_speed:",
+        "add y, 1",
+        "jmp wait_delay",
+        "decrease_speed:",
+        "sub y, 1",
+        "jmp wait_delay",
+        "wait_delay:",
+        "mov z, y",
+        "delay_loop:",
+        "jmp z--, delay_loop",
+        "mov osr, y",
+        "out pins, 1 [1]",
+        "out pins, 0 [1]",
+        "jmp loop",
+        ".wrap"
     );
-    let program = program_with_defines.program;
 
-    let mut planner = MotionPlanner::new(DEFAULT_ACCEL_MAX, DEFAULT_JERK_MAX);
+    let installed = pio.install(&program.program).unwrap();
 
-    // Add a couple of linear blocks
-    planner
-        .add_block(MotionBlock::new(
-            [0.0, 0.0, 0.0],
-            [10.0, 0.0, 0.0],
-            1200.0, // feed rate in mm/min
-            300.0,  // acceleration
-            MotionType::Linear,
-        ))
-        .unwrap();
+    let mut cfg = Config::default();
+    cfg.set_out_pins(&[step_pin.pin()]);
+    cfg.set_set_pins(&[step_pin.pin()]);
+    cfg.clock_divider = 1.0;
+    sm.set_config(&cfg);
+    sm.set_pindirs(0b1);
 
-    planner
-        .add_block(MotionBlock::new(
-            [10.0, 0.0, 0.0],
-            [10.0, 10.0, 0.0],
-            600.0,
-            300.0,
-            MotionType::Linear,
-        ))
-        .unwrap();
+    sm.set_enabled(true);
 
-    // Run lookahead to refine velocities
-    planner.lookahead_pass();
+    let mut dma_buffer = [0u32; 1];
 
-    let mut executor = StepperExecutor::new();
+    loop {
+        let target_speed = STEP_TARGET_SPEED.load(Ordering::Relaxed);
 
-    // Simulate some real-time updates (e.g., 100 Hz or 1 kHz loop)
-    let dt = 0.01; // 10 ms
-    for _ in 0..2000 {
-        executor.update(&mut planner, dt);
+        dma_buffer[0] = target_speed;
 
-        // In a real embedded app, you might break out when all blocks are done:
-        if !executor.current_block.is_some() && !planner.has_blocks() {
-            break;
+        dma.start();
+
+        Timer::after(Duration::from_millis(1)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn stepper_task() {
+    let mut current_speed: u64 = 0; // Steps per second
+    let mut target_speed: u64 = 0; // Steps per second
+
+    let mut last_update = Instant::now(); // Track time
+
+    loop {
+        let now = Instant::now();
+        let dt = (now.duration_since(last_update).as_millis() as f32) / 1000.0; // Time in seconds
+        last_update = now;
+
+        log::info!("Current Speed: {} steps/sec", current_speed);
+
+        if let Ok(cmd) = CHANNEL.try_receive() {
+            match cmd {
+                Command::Speed(speed) => {
+                    target_speed = speed.min(MAX_STEP_FREQUENCY); // Cap at max frequency
+                }
+            }
+        }
+
+        // Compute acceleration step
+        let acceleration_step = (ACCELERATION as f32 * dt).max(1.0) as u64;
+
+        // Apply acceleration linearly
+        if current_speed < target_speed {
+            current_speed += acceleration_step;
+            current_speed = current_speed.min(target_speed);
+        } else if current_speed > target_speed {
+            current_speed = current_speed.saturating_sub(acceleration_step);
+            current_speed = current_speed.max(target_speed);
+        }
+
+        // Calculate step delay time in nanoseconds
+        let step_delay = if current_speed > 0 {
+            NANOSECONDS_PER_SECOND / current_speed
+        } else {
+            0
+        };
+
+        DELAY_NS.store(step_delay, Ordering::Relaxed);
+
+        // Small delay to let other tasks run
+        Timer::after(Duration::from_millis(1)).await;
+    }
+}
+
+bind_interrupts!(struct Irqs {
+    USBCTRL_IRQ => InterruptHandler<USB>;
+});
+
+struct Handler;
+
+impl ReceiverHandler for Handler {
+    async fn handle_data(&self, data: &[u8]) {
+        if let Ok(data) = str::from_utf8(data) {
+            let data = data.trim();
+
+            let mut parts = data.split_whitespace();
+            if let Some(cmd) = parts.next() {
+                match cmd {
+                    "speed" => {
+                        if let Some(speed) = parts.next() {
+                            if let Ok(speed) = speed.parse::<u64>() {
+                                CHANNEL.send(Command::Speed(speed)).await;
+                            }
+                        }
+                    }
+                    "q" => {
+                        reset_to_usb_boot(0, 0); // Restart the chip
+                    }
+                    _ => {
+                        log::info!("Recieved: {:?}", data);
+                    }
+                }
+            }
         }
     }
 
-    // At this point, we'd have moved through all blocks.
-    assert!(!planner.has_blocks(), "All blocks should be executed");
+    fn new() -> Self {
+        Self
+    }
 }
+
+#[embassy_executor::task]
+async fn logger_task(driver: Driver<'static, USB>) {
+    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver, Handler);
+}
+
+/*
+// let program_with_defines = pio_proc::pio_file!(
+    //     "./src/prog.pio",
+    //     select_program("stepper_program"), // Optional if only one program in the file
+    // );
+    // let program = program_with_defines.program;
+
+    // let mut planner = MotionPlanner::new(DEFAULT_ACCEL_MAX, DEFAULT_JERK_MAX);
+
+    // // Add a couple of linear blocks
+    // planner
+    //     .add_block(MotionBlock::new(
+    //         [0.0, 0.0, 0.0],
+    //         [10.0, 0.0, 0.0],
+    //         1200.0, // feed rate in mm/min
+    //         300.0,  // acceleration
+    //         MotionType::Linear,
+    //     ))
+    //     .unwrap();
+
+    // planner
+    //     .add_block(MotionBlock::new(
+    //         [10.0, 0.0, 0.0],
+    //         [10.0, 10.0, 0.0],
+    //         600.0,
+    //         300.0,
+    //         MotionType::Linear,
+    //     ))
+    //     .unwrap();
+
+    // // Run lookahead to refine velocities
+    // planner.lookahead_pass();
+
+    // let mut executor = StepperExecutor::new();
+
+    // // Simulate some real-time updates (e.g., 100 Hz or 1 kHz loop)
+    // let dt = 0.01; // 10 ms
+    // for _ in 0..2000 {
+    //     executor.update(&mut planner, dt);
+
+    //     // In a real embedded app, you might break out when all blocks are done:
+    //     if !executor.current_block.is_some() && !planner.has_blocks() {
+    //         break;
+    //     }
+    // }
+
+    // // At this point, we'd have moved through all blocks.
+    // assert!(!planner.has_blocks(), "All blocks should be executed");
+*/
 
 /// Configuration: number of blocks to buffer in the planner
 const PLANNER_CAPACITY: usize = 16;
