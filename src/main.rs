@@ -69,19 +69,11 @@ async fn main(spawner: Spawner) {
     let Pio {
         mut common,
         mut sm0,
-        mut sm1,
-        mut sm2,
         ..
     } = Pio::new(p.PIO0, Irqs);
 
     let x_step_pin = common.make_pio_pin(p.PIN_0);
     let mut x_dir_pin = Output::new(p.PIN_1, Level::Low);
-
-    let y_step_pin = common.make_pio_pin(p.PIN_2);
-    let mut y_dir_pin = Output::new(p.PIN_3, Level::Low);
-
-    let z_step_pin = common.make_pio_pin(p.PIN_4);
-    let mut z_dir_pin = Output::new(p.PIN_5, Level::Low);
 
     let program = pio_proc::pio_file!("./src/prog.pio");
 
@@ -91,7 +83,6 @@ async fn main(spawner: Spawner) {
     cfg.set_set_pins(&[&x_step_pin]);
     sm0.set_config(&cfg);
     sm0.set_pin_dirs(embassy_rp::pio::Direction::Out, &[&x_step_pin]);
-    sm0.set_enable(true);
 
     spawner.spawn(controller()).unwrap();
 
@@ -104,9 +95,11 @@ async fn main(spawner: Spawner) {
                         Direction::CCW => Level::High,
                     });
                     sm0.tx().wait_push(*speed).await;
+
+                    sm0.set_enable(true);
                 }
                 AxisCommand::Stop => {
-                    sm0.tx().wait_push(0).await;
+                    sm0.set_enable(false);
                 }
             },
             _ => {}
@@ -117,7 +110,7 @@ async fn main(spawner: Spawner) {
 #[embassy_executor::task]
 async fn controller() {
     let mut machine = MotionSystem::new();
-    machine.move_to([100.0, 100.0, 0.0], 1000.0).await;
+    machine.move_to([100.0, 0.0, 0.0], 1000.0).await;
 }
 
 pub struct MotionSystem {

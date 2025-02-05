@@ -1,13 +1,19 @@
 .program stepper_program
 
 .wrap_target
-    pull noblock
-    mov y, osr
 
     set pins, 1
-    nop
+
+    set y, 312
+high_loop:
+    jmp y--, high_loop
+
     set pins, 0
 
-delay_loop:
-    jmp y--, delay_loop
+    pull noblock
+    mov x, osr
+    mov y, x
+low_loop:
+    jmp y--, low_loop
+
 .wrap
