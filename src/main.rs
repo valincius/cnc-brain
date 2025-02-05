@@ -2,7 +2,6 @@
 #![no_main]
 
 use core::str;
-use core::sync::atomic::Ordering;
 
 use embassy_executor::Spawner;
 use embassy_rp::{
@@ -12,16 +11,13 @@ use embassy_rp::{
     pio::Pio,
     rom_data::reset_to_usb_boot,
     usb::Driver,
-    Peripheral,
 };
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 use embassy_usb_logger::ReceiverHandler;
-use fixed::traits::ToFixed;
 use heapless::Vec;
 use micromath::F32Ext;
-use portable_atomic::AtomicU64;
-use {defmt_rtt as _, panic_probe as _};
+use panic_probe as _;
 
 const CHANNEL_BUFFER_CAPACITY: usize = 64;
 
@@ -31,23 +27,34 @@ static CHANNEL: embassy_sync::channel::Channel<
     CHANNEL_BUFFER_CAPACITY,
 > = Channel::new();
 
-pub enum Command {
-    Speed(u32),
+enum Direction {
+    CW,
+    CCW,
+}
+
+impl Direction {
+    pub fn from_sign(sign: f32) -> Self {
+        if sign >= 0.0 {
+            Self::CW
+        } else {
+            Self::CCW
+        }
+    }
+}
+
+enum AxisCommand {
+    Run(u32, Direction),
+    Stop,
+}
+
+enum Command {
+    SetAxes([AxisCommand; 3]),
 }
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
     USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
 });
-
-// const DEFAULT_ACCEL_MAX: f32 = 300.0; // mm/s^2
-// const DEFAULT_JERK_MAX: f32 = 1000.0; // mm/s^3 (if implementing jerk control)
-
-static DELAY_NS: AtomicU64 = AtomicU64::new(0);
-
-const MAX_STEP_FREQUENCY: u64 = 400_000; // Maximum step frequency in Hz
-const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
-const ACCELERATION: u64 = 50_000; // Steps per second² (tunable)
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -56,97 +63,169 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(p.USB, Irqs);
     spawner.spawn(logger_task(driver)).unwrap();
 
-    spawner.spawn(accel_task()).unwrap();
-
     let mut led = Output::new(p.PIN_25, Level::Low);
     led.set_high();
-
-    let mut dir_pin = Output::new(p.PIN_1, Level::Low);
 
     let Pio {
         mut common,
         mut sm0,
+        mut sm1,
+        mut sm2,
         ..
     } = Pio::new(p.PIO0, Irqs);
 
-    let step_pin = common.make_pio_pin(p.PIN_0);
+    let x_step_pin = common.make_pio_pin(p.PIN_0);
+    let mut x_dir_pin = Output::new(p.PIN_1, Level::Low);
+
+    let y_step_pin = common.make_pio_pin(p.PIN_2);
+    let mut y_dir_pin = Output::new(p.PIN_3, Level::Low);
+
+    let z_step_pin = common.make_pio_pin(p.PIN_4);
+    let mut z_dir_pin = Output::new(p.PIN_5, Level::Low);
 
     let program = pio_proc::pio_file!("./src/prog.pio");
 
     let mut cfg = embassy_rp::pio::Config::default();
     cfg.use_program(&common.load_program(&program.program), &[]);
-    cfg.set_out_pins(&[&step_pin]);
-    cfg.set_set_pins(&[&step_pin]);
+    cfg.set_out_pins(&[&x_step_pin]);
+    cfg.set_set_pins(&[&x_step_pin]);
     sm0.set_config(&cfg);
+    sm0.set_pin_dirs(embassy_rp::pio::Direction::Out, &[&x_step_pin]);
     sm0.set_enable(true);
+
+    spawner.spawn(controller()).unwrap();
 
     loop {
         match CHANNEL.receive().await {
-            Command::Speed(speed) => {
-                sm0.tx().wait_push(speed).await;
-            }
+            Command::SetAxes(cmd) => match &cmd[0] {
+                AxisCommand::Run(speed, dir) => {
+                    x_dir_pin.set_level(match dir {
+                        Direction::CW => Level::Low,
+                        Direction::CCW => Level::High,
+                    });
+                    sm0.tx().wait_push(*speed).await;
+                }
+                AxisCommand::Stop => {
+                    sm0.tx().wait_push(0).await;
+                }
+            },
+            _ => {}
         }
     }
 }
 
 #[embassy_executor::task]
-async fn accel_task() {
-    let target_pos = 50_000u32;
-    let mut current_pos = 0u32; // in steps
-    let mut current_speed = 0u32; // steps/sec
-    let max_speed = 20_000u32; // steps/sec (example)
-    let accel = 10_000u32; // steps/sec^2
-    let dt = 0.001; // 1 ms loop time
+async fn controller() {
+    let mut machine = MotionSystem::new();
+    machine.move_to([100.0, 100.0, 0.0], 1000.0).await;
+}
 
-    let mut position_f = 0.0; // keep in float
+pub struct MotionSystem {
+    current_pos: [f32; 3], // Current position of each axis
+    current_speed: f32,
+    accel: f32,           // Acceleration (steps/sec^2)
+    target_pos: [f32; 3], // Target position
+    max_speed: f32,       // Max speed along the line (steps/sec)
+}
 
-    let mut last_update = Instant::now();
+impl MotionSystem {
+    pub fn new() -> Self {
+        Self {
+            current_pos: [0.0; 3],
+            current_speed: 0.0,
+            target_pos: [0.0; 3],
+            max_speed: 0.0,
+            accel: 1000.0,
+        }
+    }
 
-    loop {
-        let now = Instant::now();
-        let dt = now.duration_since(last_update).as_millis() as f32 / 1000.0;
-        last_update = now;
+    pub fn current_pos(&self) -> [f32; 3] {
+        self.current_pos
+    }
 
-        let distance_to_go = target_pos - current_pos;
-        if distance_to_go == 0 {
-            // Done or overshot
-            current_speed = 0;
-            current_pos = target_pos;
-            CHANNEL.send(Command::Speed(0)).await;
-            break;
+    pub fn current_speed(&self) -> f32 {
+        self.current_speed
+    }
+
+    pub async fn move_to(&mut self, target: [f32; 3], max_speed: f32) {
+        self.target_pos = target;
+        self.max_speed = max_speed;
+
+        self._move().await;
+    }
+
+    async fn _move(&mut self) {
+        let start_pos = self.current_pos;
+
+        let dx = self.target_pos[0] - start_pos[0];
+        let dy = self.target_pos[1] - start_pos[1];
+        let dz = self.target_pos[2] - start_pos[2];
+
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist <= f32::EPSILON {
+            return;
         }
 
-        let decel_distance = (current_speed as f32).powi(2) / (2.0 * accel as f32);
-        if decel_distance >= distance_to_go as f32 {
-            // decelerate
-            let decel = (accel as f32 * dt) as u32;
-            if decel > current_speed {
-                current_speed = 0;
-            } else {
-                current_speed -= decel;
+        let accel = self.accel;
+        let max_speed = self.max_speed;
+        let mut speed_along_line: f32 = 0.0;
+        let mut traveled = 0.0;
+
+        let mut last_update = Instant::now();
+        let mut ticker = Ticker::every(Duration::from_millis(1));
+
+        loop {
+            let now = Instant::now();
+            let dt = now.duration_since(last_update).as_micros() as f32 / 1_000_000.0;
+            last_update = now;
+
+            let distance_to_go = dist - traveled;
+            if distance_to_go <= 0.0 {
+                self.current_speed = 0.0;
+                self.current_pos = self.target_pos;
+
+                CHANNEL
+                    .send(Command::SetAxes([const { AxisCommand::Stop }; 3]))
+                    .await;
+                break;
             }
-        } else {
-            // accelerate or cruise
-            if current_speed < max_speed {
-                current_speed += (accel as f32 * dt) as u32;
-                if current_speed > max_speed {
-                    current_speed = max_speed;
+
+            // Check deceleration distance: v^2 / (2*a)
+            let decel_distance = speed_along_line.powi(2) / (2.0 * accel);
+            if decel_distance >= distance_to_go {
+                speed_along_line -= accel * dt;
+                speed_along_line = speed_along_line.max(0.0);
+            } else {
+                if speed_along_line < max_speed {
+                    speed_along_line += accel * dt;
+                    speed_along_line = speed_along_line.min(max_speed);
                 }
             }
+
+            self.current_speed = speed_along_line;
+
+            // Move along the line by delta_dist = speed * dt
+            let delta_dist = speed_along_line * dt;
+            traveled += delta_dist;
+
+            let ratio = delta_dist / dist;
+            self.current_pos[0] += dx * ratio;
+            self.current_pos[1] += dy * ratio;
+            self.current_pos[2] += dz * ratio;
+
+            let speed_x = (speed_along_line * (dx / dist)).abs() as u32;
+            let speed_y = (speed_along_line * (dy / dist)).abs() as u32;
+            let speed_z = (speed_along_line * (dz / dist)).abs() as u32;
+
+            let cmd = [
+                AxisCommand::Run(speed_x, Direction::from_sign(dx)),
+                AxisCommand::Run(speed_y, Direction::from_sign(dy)),
+                AxisCommand::Run(speed_z, Direction::from_sign(dz)),
+            ];
+            CHANNEL.send(Command::SetAxes(cmd)).await;
+
+            ticker.next().await;
         }
-
-        // Compute how many steps we move in this time slice
-        let delta = current_speed as f32 * dt;
-        position_f += delta;
-        let whole_steps = position_f.floor() as u32;
-        position_f -= whole_steps as f32;
-        current_pos += whole_steps;
-
-        // Send integer speed to PIO
-        let _ = CHANNEL.try_send(Command::Speed(current_speed));
-
-        // Wait dt
-        Timer::after(Duration::from_millis(1)).await;
     }
 }
 
@@ -160,13 +239,13 @@ impl ReceiverHandler for Handler {
             let mut parts = data.split_whitespace();
             if let Some(cmd) = parts.next() {
                 match cmd {
-                    "speed" => {
-                        if let Some(speed) = parts.next() {
-                            if let Ok(speed) = speed.parse::<u32>() {
-                                CHANNEL.send(Command::Speed(speed)).await;
-                            }
-                        }
-                    }
+                    // "speed" => {
+                    //     if let Some(speed) = parts.next() {
+                    //         if let Ok(speed) = speed.parse::<u32>() {
+                    //             CHANNEL.send(Command::Speed(speed)).await;
+                    //         }
+                    //     }
+                    // }
                     "q" => {
                         reset_to_usb_boot(0, 0); // Restart the chip
                     }
