@@ -43,3 +43,4 @@ pio = "0.2"
 rand = { version = "0.8.5", default-features = false }
 heapless = "0.8.0"
 micromath = "2.1.0"
+assign-resources = "0.4.1"
