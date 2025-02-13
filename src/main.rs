@@ -133,7 +133,7 @@ async fn core1_main(r: Core1Resources, spawner: Spawner) {
     let mut x_cfg = Config::default();
     x_cfg.set_set_pins(&[&x_step]);
     x_cfg.use_program(&stepper_prog, &[]);
-    x_cfg.clock_divider = (CPU_CLOCK_HZ / 200_000).to_fixed();
+    x_cfg.clock_divider = (104.17).to_fixed(); // 125MHz / 104.17 = 1.2MHz = we are aiming for 200khz max pulse rate (5us per pulse), each pulse is 6 cycles
 
     x_sm.set_config(&x_cfg);
     x_sm.set_enable(true);
@@ -324,9 +324,9 @@ async fn controller(
                 let rate_y = (steps_y_abs as f32) / dt; // steps/s
                 let rate_z = (steps_z_abs as f32) / dt; // steps/s
 
-                let step_period_x = (200_000 as f32 / rate_x) as u32;
-                let step_period_y = (200_000 as f32 / rate_y) as u32;
-                let step_period_z = (200_000 as f32 / rate_z) as u32;
+                let step_period_x = (200_000 as f32 / rate_x) as u32 * 1200;
+                let step_period_y = (200_000 as f32 / rate_y) as u32 * 1200;
+                let step_period_z = (200_000 as f32 / rate_z) as u32 * 1200;
 
                 log::info!(
                     "pos: [{}, {}, {}], steps: [{}, {}, {}], rates: [{}, {}, {}]",
