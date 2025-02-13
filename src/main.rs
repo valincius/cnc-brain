@@ -202,7 +202,7 @@ async fn controller(
         current_speed: 0.0,
     };
 
-    let accel = 500.0f32;
+    let accel = 100.0f32;
 
     let micro_steps = 16;
 
@@ -215,8 +215,13 @@ async fn controller(
 
     let chan = embassy_rp::dma::Channel::regs(&x_step_buf);
     let mut x_step_buf_ref = x_step_buf.into_ref();
-    let mut x_buffer = [0u32; 512];
-    let mut iter = 0;
+    let mut x_buffer_a = [0u32; 128];
+    let mut x_buffer_b = [0u32; 128];
+
+    let mut x_buffer_use = 0;
+
+    let mut iter_a = 0;
+    let mut iter_b = 0;
 
     loop {
         if let Ok(block) = MOTION_QUEUE.try_receive() {
@@ -235,17 +240,40 @@ async fn controller(
             let mut traveled = 0.0;
             let mut current_vel = 0.0; // or carry over from prior block
             let max_vel = feed_rate; // in, say, mm/s
-            let dt = 0.0001; // 100us
+            let dt = 0.001; // 1ms
             let mut is_decelerating = false;
 
             let epsilon = 0.001; // mm
 
             while traveled < distance - epsilon {
                 if chan.trans_count().read() == 0 {
+                    let iter = if x_buffer_use == 0 {
+                        &mut iter_a
+                    } else {
+                        &mut iter_b
+                    };
+                    *iter = 0; // done reading, reset iter
+
+                    let x_buffer = if x_buffer_use == 0 {
+                        x_buffer_b
+                    } else {
+                        x_buffer_a
+                    };
+
                     x_sm.tx()
                         .dma_push(x_step_buf_ref.reborrow(), &x_buffer)
                         .await;
-                    iter = 0;
+
+                    x_buffer_use = 1 - x_buffer_use;
+                }
+
+                let iter = if x_buffer_use == 0 {
+                    &mut iter_b
+                } else {
+                    &mut iter_a
+                };
+                if *iter >= 128 {
+                    continue;
                 }
 
                 let dist_left = distance - traveled;
@@ -314,10 +342,16 @@ async fn controller(
                 );
 
                 if steps_x_abs > 0 {
-                    x_buffer[iter] = steps_x_abs;
-                    x_buffer[iter + 1] = step_period_x;
+                    let x_buffer = if x_buffer_use == 0 {
+                        &mut x_buffer_b
+                    } else {
+                        &mut x_buffer_a
+                    };
 
-                    iter += 2;
+                    x_buffer[*iter] = steps_x_abs;
+                    x_buffer[*iter + 1] = step_period_x;
+
+                    *iter += 2;
                 }
 
                 // y_sm.tx().wait_push(rate_y as u32).await;
