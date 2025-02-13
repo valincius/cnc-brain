@@ -14,7 +14,7 @@ use embassy_rp::{
     pio::{Pio, StateMachine},
     rom_data::reset_to_usb_boot,
 };
-use embassy_rp::{peripherals, Peripheral};
+use embassy_rp::{pac, peripherals, Peripheral};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Ticker, Timer};
@@ -213,8 +213,9 @@ async fn controller(
         steps_per_mm[2] * micro_steps as f32,
     ];
 
+    let chan = embassy_rp::dma::Channel::regs(&x_step_buf);
     let mut x_step_buf_ref = x_step_buf.into_ref();
-    let mut x_buffer = [0u32; 256];
+    let mut x_buffer = [0u32; 512];
     let mut iter = 0;
 
     loop {
@@ -240,13 +241,11 @@ async fn controller(
             let epsilon = 0.001; // mm
 
             while traveled < distance - epsilon {
-                if iter >= x_buffer.len() {
+                if chan.trans_count().read() == 0 {
                     x_sm.tx()
                         .dma_push(x_step_buf_ref.reborrow(), &x_buffer)
                         .await;
                     iter = 0;
-                } else {
-                    Timer::after(Duration::from_millis(1)).await;
                 }
 
                 let dist_left = distance - traveled;
@@ -326,6 +325,8 @@ async fn controller(
 
                 // z_sm.tx().wait_push(rate_z as u32).await;
                 // z_sm.tx().wait_push(step_period_z).await;
+
+                Timer::after(Duration::from_millis(1)).await;
             }
 
             log::info!("Done moving");
