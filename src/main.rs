@@ -7,6 +7,7 @@ use assign_resources::assign_resources;
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals;
+use embassy_rp::pio::{Config, Direction};
 use embassy_rp::{
     bind_interrupts,
     gpio::{Level, Output},
@@ -34,6 +35,8 @@ static CONTROLLER_CHANNEL: embassy_sync::channel::Channel<
 
 static MOTION_QUEUE: embassy_sync::channel::Channel<CriticalSectionRawMutex, MotionCommand, 128> =
     Channel::new();
+
+const CPU_CLOCK_HZ: u32 = 125_000_000;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
@@ -90,13 +93,50 @@ async fn core0_main(r: Core0Resources, spawner: Spawner) {
 async fn core1_main(r: Core1Resources, spawner: Spawner) {
     let Pio {
         mut common,
-        sm0,
+        sm0: mut x_sm,
         sm1,
         sm2,
         ..
     } = Pio::new(r.pio, Irqs);
 
-    spawner.spawn(controller(sm0, sm1, sm2)).unwrap();
+    let stepper_prog = pio_proc::pio_asm!(
+        "set pindirs 1"
+
+        ".wrap_target"
+
+        "pull"
+        "mov x osr" // Set X to number of steps
+        "pull"
+        "mov y osr" // Set Y to delay between steps
+        "mov isr y" // Copy to ISR
+
+        "step:"
+        "set pins 1"
+        "nop"
+        "set pins 0"
+
+        "mov y isr" // Reload delay
+        "delay:"
+        "jmp y-- delay"
+
+        "jmp x-- step"
+
+        ".wrap"
+    );
+
+    let stepper_prog = common.load_program(&stepper_prog.program);
+
+    let x_step = common.make_pio_pin(r.x_step);
+    let x_dir = Output::new(r.x_dir, Level::Low);
+
+    let mut x_cfg = Config::default();
+    x_cfg.set_set_pins(&[&x_step]);
+    x_cfg.use_program(&stepper_prog, &[]);
+
+    x_sm.set_config(&x_cfg);
+    x_sm.set_enable(true);
+
+    spawner.spawn(controller(x_sm, sm1, sm2)).unwrap();
 
     let mut ticker = Ticker::every(Duration::from_secs(1));
     loop {
@@ -229,14 +269,17 @@ async fn controller(
                 // let dir_y = if steps_y >= 0 { 1 } else { 0 };
                 // let dir_z = if steps_z >= 0 { 1 } else { 0 };
 
-                let steps_x_abs = steps_x.abs();
-                let steps_y_abs = steps_y.abs();
-                let steps_z_abs = steps_z.abs();
+                let steps_x_abs = steps_x.abs() as u32;
+                let steps_y_abs = steps_y.abs() as u32;
+                let steps_z_abs = steps_z.abs() as u32;
 
                 let rate_x = (steps_x_abs as f32) / dt; // steps/s
-                '
                 let rate_y = (steps_y_abs as f32) / dt; // steps/s
                 let rate_z = (steps_z_abs as f32) / dt; // steps/s
+
+                let step_period_x = (CPU_CLOCK_HZ as f32 / rate_x) as u32;
+                let step_period_y = (CPU_CLOCK_HZ as f32 / rate_y) as u32;
+                let step_period_z = (CPU_CLOCK_HZ as f32 / rate_z) as u32;
 
                 log::info!(
                     "pos: [{}, {}, {}], steps: [{}, {}, {}], rates: [{}, {}, {}]",
@@ -246,13 +289,15 @@ async fn controller(
                     steps_x,
                     steps_y,
                     steps_z,
-                    rate_x,
-                    rate_y,
-                    rate_z
+                    step_period_x,
+                    step_period_y,
+                    step_period_z
                 );
 
-                // x_sm.tx().wait_push(rate_x as u32).await;
-                // x_sm.tx().wait_push(step_period_x).await;
+                if steps_x_abs > 0 {
+                    x_sm.tx().wait_push(steps_x_abs).await;
+                    x_sm.tx().wait_push(step_period_x).await;
+                }
 
                 // y_sm.tx().wait_push(rate_y as u32).await;
                 // y_sm.tx().wait_push(step_period_y).await;
