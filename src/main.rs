@@ -6,7 +6,7 @@ use core::str;
 use assign_resources::assign_resources;
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::multicore::{spawn_core1, Stack};
-use embassy_rp::pio::{Config, Direction};
+use embassy_rp::pio::Config;
 use embassy_rp::{
     bind_interrupts,
     gpio::{Level, Output},
@@ -214,6 +214,8 @@ async fn controller(
     ];
 
     let mut x_step_buf_ref = x_step_buf.into_ref();
+    let mut x_buffer = [0u32; 256];
+    let mut iter = 0;
 
     loop {
         if let Ok(block) = MOTION_QUEUE.try_receive() {
@@ -228,7 +230,6 @@ async fn controller(
             let dz = z1 - z0;
 
             let distance = dist3d(x0, y0, z0, x1, y1, z1);
-            log::info!("distance: {}", distance);
 
             let mut traveled = 0.0;
             let mut current_vel = 0.0; // or carry over from prior block
@@ -238,10 +239,16 @@ async fn controller(
 
             let epsilon = 0.001; // mm
 
-            let mut x_buffer = [0u32; 256];
-            let mut iter = 0;
-
             while traveled < distance - epsilon {
+                if iter >= x_buffer.len() {
+                    x_sm.tx()
+                        .dma_push(x_step_buf_ref.reborrow(), &x_buffer)
+                        .await;
+                    iter = 0;
+                } else {
+                    Timer::after(Duration::from_millis(1)).await;
+                }
+
                 let dist_left = distance - traveled;
 
                 if is_decelerating {
@@ -314,20 +321,11 @@ async fn controller(
                     iter += 2;
                 }
 
-                if iter >= x_buffer.len() {
-                    x_sm.tx()
-                        .dma_push(x_step_buf_ref.reborrow(), &x_buffer)
-                        .await;
-                    iter = 0;
-                }
-
                 // y_sm.tx().wait_push(rate_y as u32).await;
                 // y_sm.tx().wait_push(step_period_y).await;
 
                 // z_sm.tx().wait_push(rate_z as u32).await;
                 // z_sm.tx().wait_push(step_period_z).await;
-
-                Timer::after(Duration::from_micros(100)).await;
             }
 
             log::info!("Done moving");
