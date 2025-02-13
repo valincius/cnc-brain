@@ -6,7 +6,6 @@ use core::str;
 use assign_resources::assign_resources;
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::multicore::{spawn_core1, Stack};
-use embassy_rp::peripherals;
 use embassy_rp::pio::{Config, Direction};
 use embassy_rp::{
     bind_interrupts,
@@ -15,10 +14,12 @@ use embassy_rp::{
     pio::{Pio, StateMachine},
     rom_data::reset_to_usb_boot,
 };
+use embassy_rp::{peripherals, Peripheral};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb_logger::ReceiverHandler;
+use fixed::traits::ToFixed;
 use libm::hypotf;
 use panic_probe as _;
 use static_cell::StaticCell;
@@ -53,6 +54,7 @@ assign_resources! {
         pio: PIO0,
         x_step: PIN_0,
         x_dir: PIN_1,
+        x_step_buf: DMA_CH0,
     }
 }
 
@@ -111,8 +113,7 @@ async fn core1_main(r: Core1Resources, spawner: Spawner) {
         "mov isr y" // Copy to ISR
 
         "step:"
-        "set pins 1"
-        "nop"
+        "set pins 1 [1]"
         "set pins 0"
 
         "mov y isr" // Reload delay
@@ -132,11 +133,12 @@ async fn core1_main(r: Core1Resources, spawner: Spawner) {
     let mut x_cfg = Config::default();
     x_cfg.set_set_pins(&[&x_step]);
     x_cfg.use_program(&stepper_prog, &[]);
+    x_cfg.clock_divider = (CPU_CLOCK_HZ / 200_000).to_fixed();
 
     x_sm.set_config(&x_cfg);
     x_sm.set_enable(true);
 
-    spawner.spawn(controller(x_sm, sm1, sm2)).unwrap();
+    spawner.spawn(controller(x_sm, r.x_step_buf)).unwrap();
 
     let mut ticker = Ticker::every(Duration::from_secs(1));
     loop {
@@ -158,7 +160,7 @@ impl ReceiverHandler for Handler {
                 match cmd {
                     "go" => {
                         CONTROLLER_CHANNEL
-                            .send(ControllerCommand::MoveTo([100.0, 100.0, 100.0], 25.0))
+                            .send(ControllerCommand::MoveTo([250.0, 250.0, 250.0], 1000.0))
                             .await;
                     }
                     "stop" => {
@@ -193,17 +195,25 @@ enum ControllerCommand {
 #[embassy_executor::task]
 async fn controller(
     mut x_sm: StateMachine<'static, PIO0, 0>,
-    mut y_sm: StateMachine<'static, PIO0, 1>,
-    mut z_sm: StateMachine<'static, PIO0, 2>,
+    mut x_step_buf: peripherals::DMA_CH0,
 ) {
     let mut machine = SystemState {
         current_pos: [0.0; 3],
         current_speed: 0.0,
     };
 
-    let accel = 100.0f32; // mm/s^2
+    let accel = 500.0f32;
+
+    let micro_steps = 16;
 
     let steps_per_mm = [267.0f32, 267.0f32, 267.0f32];
+    let steps_per_mm = [
+        steps_per_mm[0] * micro_steps as f32,
+        steps_per_mm[1] * micro_steps as f32,
+        steps_per_mm[2] * micro_steps as f32,
+    ];
+
+    let mut x_step_buf_ref = x_step_buf.into_ref();
 
     loop {
         if let Ok(block) = MOTION_QUEUE.try_receive() {
@@ -223,10 +233,13 @@ async fn controller(
             let mut traveled = 0.0;
             let mut current_vel = 0.0; // or carry over from prior block
             let max_vel = feed_rate; // in, say, mm/s
-            let dt = 0.001; // 1 ms
+            let dt = 0.0001; // 100us
             let mut is_decelerating = false;
 
             let epsilon = 0.001; // mm
+
+            let mut x_buffer = [0u32; 256];
+            let mut iter = 0;
 
             while traveled < distance - epsilon {
                 let dist_left = distance - traveled;
@@ -277,9 +290,9 @@ async fn controller(
                 let rate_y = (steps_y_abs as f32) / dt; // steps/s
                 let rate_z = (steps_z_abs as f32) / dt; // steps/s
 
-                let step_period_x = (CPU_CLOCK_HZ as f32 / rate_x) as u32;
-                let step_period_y = (CPU_CLOCK_HZ as f32 / rate_y) as u32;
-                let step_period_z = (CPU_CLOCK_HZ as f32 / rate_z) as u32;
+                let step_period_x = (200_000 as f32 / rate_x) as u32;
+                let step_period_y = (200_000 as f32 / rate_y) as u32;
+                let step_period_z = (200_000 as f32 / rate_z) as u32;
 
                 log::info!(
                     "pos: [{}, {}, {}], steps: [{}, {}, {}], rates: [{}, {}, {}]",
@@ -295,8 +308,17 @@ async fn controller(
                 );
 
                 if steps_x_abs > 0 {
-                    x_sm.tx().wait_push(steps_x_abs).await;
-                    x_sm.tx().wait_push(step_period_x).await;
+                    x_buffer[iter] = steps_x_abs;
+                    x_buffer[iter + 1] = step_period_x;
+
+                    iter += 2;
+                }
+
+                if iter >= x_buffer.len() {
+                    x_sm.tx()
+                        .dma_push(x_step_buf_ref.reborrow(), &x_buffer)
+                        .await;
+                    iter = 0;
                 }
 
                 // y_sm.tx().wait_push(rate_y as u32).await;
@@ -305,7 +327,7 @@ async fn controller(
                 // z_sm.tx().wait_push(rate_z as u32).await;
                 // z_sm.tx().wait_push(step_period_z).await;
 
-                Timer::after(Duration::from_millis(1)).await;
+                Timer::after(Duration::from_micros(100)).await;
             }
 
             log::info!("Done moving");
