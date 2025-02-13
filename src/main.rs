@@ -20,11 +20,11 @@ use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb_logger::ReceiverHandler;
 use fixed::traits::ToFixed;
-use libm::hypotf;
+use libm::{fabsf, floorf, hypotf};
 use panic_probe as _;
 use static_cell::StaticCell;
 
-static mut CORE1_STACK: Stack<{ 2 << 14 }> = Stack::new();
+static mut CORE1_STACK: Stack<{ 2 << 15 }> = Stack::new();
 static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
 static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 
@@ -36,8 +36,6 @@ static CONTROLLER_CHANNEL: embassy_sync::channel::Channel<
 
 static MOTION_QUEUE: embassy_sync::channel::Channel<CriticalSectionRawMutex, MotionCommand, 128> =
     Channel::new();
-
-const CPU_CLOCK_HZ: u32 = 125_000_000;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
@@ -160,7 +158,7 @@ impl ReceiverHandler for Handler {
                 match cmd {
                     "go" => {
                         CONTROLLER_CHANNEL
-                            .send(ControllerCommand::MoveTo([250.0, 250.0, 250.0], 1000.0))
+                            .send(ControllerCommand::MoveTo([250.0, 250.0, 250.0], 7500.0))
                             .await;
                     }
                     "stop" => {
@@ -193,16 +191,13 @@ enum ControllerCommand {
 }
 
 #[embassy_executor::task]
-async fn controller(
-    mut x_sm: StateMachine<'static, PIO0, 0>,
-    mut x_step_buf: peripherals::DMA_CH0,
-) {
-    let mut machine = SystemState {
+async fn controller(mut x_sm: StateMachine<'static, PIO0, 0>, x_step_buf: peripherals::DMA_CH0) {
+    let machine = SystemState {
         current_pos: [0.0; 3],
         current_speed: 0.0,
     };
 
-    let accel = 100.0f32;
+    let accel = 100_000.0f32;
 
     let micro_steps = 16;
 
@@ -213,15 +208,8 @@ async fn controller(
         steps_per_mm[2] * micro_steps as f32,
     ];
 
-    let chan = embassy_rp::dma::Channel::regs(&x_step_buf);
     let mut x_step_buf_ref = x_step_buf.into_ref();
-    let mut x_buffer_a = [0u32; 128];
-    let mut x_buffer_b = [0u32; 128];
-
-    let mut x_buffer_use = 0;
-
-    let mut iter_a = 0;
-    let mut iter_b = 0;
+    let mut ring = RingBuffer::new();
 
     loop {
         if let Ok(block) = MOTION_QUEUE.try_receive() {
@@ -240,40 +228,22 @@ async fn controller(
             let mut traveled = 0.0;
             let mut current_vel = 0.0; // or carry over from prior block
             let max_vel = feed_rate; // in, say, mm/s
-            let dt = 0.001; // 1ms
+            let dt = 0.0001; // 1ms
             let mut is_decelerating = false;
 
             let epsilon = 0.001; // mm
 
+            let mut delay_accum: f32 = 0.0;
+
             while traveled < distance - epsilon {
-                if chan.trans_count().read() == 0 {
-                    let iter = if x_buffer_use == 0 {
-                        &mut iter_a
-                    } else {
-                        &mut iter_b
-                    };
-                    *iter = 0; // done reading, reset iter
-
-                    let x_buffer = if x_buffer_use == 0 {
-                        x_buffer_b
-                    } else {
-                        x_buffer_a
-                    };
-
+                if ring.len() > 0 {
+                    let contiguous = ring.contiguous_data();
                     x_sm.tx()
-                        .dma_push(x_step_buf_ref.reborrow(), &x_buffer)
+                        .dma_push(x_step_buf_ref.reborrow(), contiguous)
                         .await;
-
-                    x_buffer_use = 1 - x_buffer_use;
-                }
-
-                let iter = if x_buffer_use == 0 {
-                    &mut iter_b
-                } else {
-                    &mut iter_a
-                };
-                if *iter >= 128 {
-                    continue;
+                    let len = contiguous.len();
+                    ring.consume(len);
+                    log::info!("Pushed {} steps", len);
                 }
 
                 let dist_left = distance - traveled;
@@ -304,9 +274,9 @@ async fn controller(
                 let step_y_mm = dy * frac;
                 let step_z_mm = dz * frac;
 
-                let steps_x = (step_x_mm * steps_per_mm[0]) as i32;
-                let steps_y = (step_y_mm * steps_per_mm[1]) as i32;
-                let steps_z = (step_z_mm * steps_per_mm[2]) as i32;
+                let steps_x = step_x_mm * steps_per_mm[0];
+                let steps_y = step_y_mm * steps_per_mm[1];
+                let steps_z = step_z_mm * steps_per_mm[2];
 
                 x0 += step_x_mm;
                 y0 += step_y_mm;
@@ -316,42 +286,38 @@ async fn controller(
                 // let dir_y = if steps_y >= 0 { 1 } else { 0 };
                 // let dir_z = if steps_z >= 0 { 1 } else { 0 };
 
-                let steps_x_abs = steps_x.abs() as u32;
-                let steps_y_abs = steps_y.abs() as u32;
-                let steps_z_abs = steps_z.abs() as u32;
+                let steps_x_abs = fabsf(steps_x);
+                // let steps_y_abs = steps_y.abs() as u32;
+                // let steps_z_abs = steps_z.abs() as u32;
 
                 let rate_x = (steps_x_abs as f32) / dt; // steps/s
-                let rate_y = (steps_y_abs as f32) / dt; // steps/s
-                let rate_z = (steps_z_abs as f32) / dt; // steps/s
+                                                        // let rate_y = (steps_y_abs as f32) / dt; // steps/s
+                                                        // let rate_z = (steps_z_abs as f32) / dt; // steps/s
 
-                let step_period_x = (200_000 as f32 / rate_x) as u32 * 1200;
-                let step_period_y = (200_000 as f32 / rate_y) as u32 * 1200;
-                let step_period_z = (200_000 as f32 / rate_z) as u32 * 1200;
+                let step_period_x = ((1200 * 200_000) as f32 / rate_x);
+                // let step_period_y = ((1200 * 200_000) as f32 / rate_y) as u32;
+                // let step_period_z = ((1200 * 200_000) as f32 / rate_z) as u32;
+
+                delay_accum += step_period_x;
+
+                // Extract the integer part to use as the delay
+                let delay_cycles = floorf(delay_accum) as u32;
+
+                // Subtract the integer part, leaving the fractional remainder
+                delay_accum -= delay_cycles as f32;
 
                 log::info!(
-                    "pos: [{}, {}, {}], steps: [{}, {}, {}], rates: [{}, {}, {}]",
+                    "pos: {}, speed: {}, rate: {}, period: {}",
                     x0,
-                    y0,
-                    z0,
-                    steps_x,
-                    steps_y,
-                    steps_z,
-                    step_period_x,
-                    step_period_y,
-                    step_period_z
+                    current_vel,
+                    rate_x,
+                    delay_cycles
                 );
 
-                if steps_x_abs > 0 {
-                    let x_buffer = if x_buffer_use == 0 {
-                        &mut x_buffer_b
-                    } else {
-                        &mut x_buffer_a
-                    };
-
-                    x_buffer[*iter] = steps_x_abs;
-                    x_buffer[*iter + 1] = step_period_x;
-
-                    *iter += 2;
+                if steps_x_abs > 0.0 {
+                    // It is safe to unwrap here because we waited for free space.
+                    ring.push(steps_x_abs as u32).unwrap();
+                    ring.push(delay_cycles).unwrap();
                 }
 
                 // y_sm.tx().wait_push(rate_y as u32).await;
@@ -360,7 +326,15 @@ async fn controller(
                 // z_sm.tx().wait_push(rate_z as u32).await;
                 // z_sm.tx().wait_push(step_period_z).await;
 
-                Timer::after(Duration::from_millis(1)).await;
+                Timer::after(Duration::from_micros(100)).await;
+            }
+
+            while ring.len() > 0 {
+                let contiguous = ring.contiguous_data();
+                x_sm.tx()
+                    .dma_push(x_step_buf_ref.reborrow(), contiguous)
+                    .await;
+                ring.consume(contiguous.len());
             }
 
             log::info!("Done moving");
@@ -379,6 +353,61 @@ async fn controller(
                 log::info!("!!Stopping!!");
             }
         }
+    }
+}
+
+struct RingBuffer {
+    buffer: [u32; 256],
+    head: usize,
+    tail: usize,
+}
+
+impl RingBuffer {
+    fn new() -> Self {
+        Self {
+            buffer: [0; 256],
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    // Number of items currently stored.
+    fn len(&self) -> usize {
+        if self.head >= self.tail {
+            self.head - self.tail
+        } else {
+            self.buffer.len() - self.tail + self.head
+        }
+    }
+
+    // Free space remaining.
+    fn free_space(&self) -> usize {
+        self.buffer.len() - self.len()
+    }
+
+    // Push a value into the ring buffer. Returns Err if no space.
+    fn push(&mut self, item: u32) -> Result<(), ()> {
+        if self.free_space() == 0 {
+            Err(())
+        } else {
+            self.buffer[self.head] = item;
+            self.head = (self.head + 1) % self.buffer.len();
+            Ok(())
+        }
+    }
+
+    // Returns a contiguous slice from tail up to the end (or head if no wrap-around).
+    fn contiguous_data(&self) -> &[u32] {
+        if self.head >= self.tail {
+            &self.buffer[self.tail..self.head]
+        } else {
+            &self.buffer[self.tail..self.buffer.len()]
+        }
+    }
+
+    // Mark `count` items as consumed.
+    fn consume(&mut self, count: usize) {
+        self.tail = (self.tail + count) % self.buffer.len();
     }
 }
 
