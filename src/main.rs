@@ -2,8 +2,12 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
-use core::str;
+use cnc_brain::receiver::usb_comm_task;
+use cnc_brain::{ControllerCommand, CONTROLLER_CHANNEL};
 
+use cortex_m_rt::{entry, exception};
+use embassy_rp::dma::Channel as _;
+use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_sync::channel::Channel;
 use static_cell::StaticCell;
 
@@ -16,23 +20,22 @@ use embassy_rp::{
     gpio::{Level, Output},
     interrupt,
     peripherals::{PIO0 as pPIO0, USB as pUSB},
-    pio::{Pio, StateMachine},
+    pio::Pio,
     rom_data::reset_to_usb_boot,
 };
 use embassy_rp::{peripherals, Peripheral as _};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Ticker, Timer};
-use embassy_usb_logger::ReceiverHandler;
 use fixed::traits::ToFixed;
 use libm::{fabsf, floorf, hypotf};
 
+static mut CORE1_STACK: Stack<4096> = Stack::new();
+
 static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
+static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 static EXECUTOR_HI: InterruptExecutor = InterruptExecutor::new();
 
-static CONTROLLER_CHANNEL: Channel<CriticalSectionRawMutex, ControllerCommand, 16> = Channel::new();
-
 static MOTION_QUEUE: Channel<CriticalSectionRawMutex, MotionCommand, 128> = Channel::new();
-
 static STEP_CHANNEL: Channel<CriticalSectionRawMutex, u32, 1024> = Channel::new();
 
 bind_interrupts!(struct Irqs {
@@ -41,12 +44,12 @@ bind_interrupts!(struct Irqs {
 });
 
 assign_resources! {
-    c0: Core0Resources {
+    for_controller: ControllerResources {
         usb: USB,
         led: PIN_25,
     }
 
-    c1: Core1Resources {
+    for_motion: MotionResources {
         pio: PIO0,
         x_step: PIN_0,
         x_dir: PIN_1,
@@ -60,34 +63,48 @@ unsafe fn SWI_IRQ_0() {
     EXECUTOR_HI.on_interrupt()
 }
 
-#[cortex_m_rt::entry]
+#[entry]
 fn main() -> ! {
     let p = embassy_rp::init(Default::default());
     let r = split_resources!(p);
 
-    // spawn_core1(
-    //     p.CORE1,
-    //     unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
-    //     move || {
-    //         let executor1 = EXECUTOR1.init(Executor::new());
-    //         executor1.run(move |spawner| spawner.spawn(core1_main(r.c1, spawner)).unwrap());
-    //     },
-    // );
+    spawn_core1(
+        p.CORE1,
+        unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
+        move || {
+            let executor1 = EXECUTOR1.init(Executor::new());
+            executor1.run(|spawner| spawner.must_spawn(controller_task(r.for_controller)));
+        },
+    );
 
     interrupt::SWI_IRQ_0.set_priority(Priority::P3);
     let spawner = EXECUTOR_HI.start(interrupt::SWI_IRQ_0);
-    spawner.must_spawn(core1_main(r.c1));
+    spawner.must_spawn(stepper_task(r.for_motion));
 
     let executor0 = EXECUTOR0.init(Executor::new());
-    executor0.run(move |spawner| spawner.spawn(core0_main(r.c0, spawner)).unwrap());
+    executor0.run(|spawner| spawner.must_spawn(main_task()));
 }
 
 #[embassy_executor::task]
-async fn core0_main(r: Core0Resources, spawner: Spawner) {
+async fn main_task() {
+    let spawner = Spawner::for_current_executor().await;
+
+    spawner.must_spawn(motion_task());
+
+    let mut ticker = Ticker::every(Duration::from_secs(5));
+    loop {
+        log::info!("Core 0 running");
+
+        ticker.next().await;
+    }
+}
+
+#[embassy_executor::task]
+async fn controller_task(r: ControllerResources) {
+    let spawner = Spawner::for_current_executor().await;
+
     let usb_driver = embassy_rp::usb::Driver::new(r.usb, Irqs);
     spawner.spawn(usb_comm_task(usb_driver)).unwrap();
-
-    log::info!("Core 0 started");
 
     let mut led = Output::new(r.led, Level::Low);
 
@@ -100,15 +117,7 @@ async fn core0_main(r: Core0Resources, spawner: Spawner) {
 }
 
 #[embassy_executor::task]
-async fn core1_main(r: Core1Resources) {
-    Timer::after_secs(5).await;
-
-    log::info!("Core 1 started");
-
-    let spawner = Spawner::for_current_executor().await;
-
-    log::info!("Got spawner");
-
+async fn stepper_task(r: MotionResources) {
     let Pio {
         mut common,
         mut sm0,
@@ -139,14 +148,10 @@ async fn core1_main(r: Core1Resources) {
         ".wrap"
     );
 
-    log::info!("Loaded stepper program");
-
     let stepper_prog = common.load_program(&stepper_prog.program);
 
-    log::info!("Loaded stepper program");
-
     let x_step = common.make_pio_pin(r.x_step);
-    let x_dir = Output::new(r.x_dir, Level::Low);
+    let _x_dir = Output::new(r.x_dir, Level::Low);
 
     let mut step_pio_cfg = Config::default();
     step_pio_cfg.set_set_pins(&[&x_step]);
@@ -156,91 +161,41 @@ async fn core1_main(r: Core1Resources) {
     sm0.set_config(&step_pio_cfg);
     sm0.set_enable(true);
 
-    log::info!("Enabled stepper program");
-
-    if spawner.spawn(controller()).is_ok() {
-        log::info!("Spawned controller");
-    } else {
-        log::info!("Failed to spawn controller");
-    }
-
-    if spawner.spawn(step_consumer(sm0, r.step_dma0)).is_ok() {
-        log::info!("Spawned step consumer");
-    } else {
-        log::info!("Failed to spawn step consumer");
-    }
-
-    let mut ticker = Ticker::every(Duration::from_secs(1));
-    loop {
-        log::info!("Core 1 running");
-
-        ticker.next().await;
-    }
-}
-
-struct Handler;
-
-impl ReceiverHandler for Handler {
-    async fn handle_data(&self, data: &[u8]) {
-        if let Ok(data) = str::from_utf8(data) {
-            let data = data.trim();
-
-            let mut parts = data.split_whitespace();
-            if let Some(cmd) = parts.next() {
-                match cmd {
-                    "go" => {
-                        CONTROLLER_CHANNEL
-                            .send(ControllerCommand::MoveTo([250.0, 250.0, 250.0], 7500.0))
-                            .await;
-                    }
-                    "stop" => {
-                        CONTROLLER_CHANNEL.send(ControllerCommand::Stop).await;
-                    }
-                    "q" => {
-                        reset_to_usb_boot(0, 0); // Restart the chip
-                    }
-                    _ => {
-                        log::info!("Unknown command: {}", cmd);
-                    }
-                }
-            }
-        }
-    }
-
-    fn new() -> Self {
-        Self
-    }
-}
-
-#[embassy_executor::task]
-async fn usb_comm_task(driver: embassy_rp::usb::Driver<'static, pUSB>) {
-    embassy_usb_logger::run!(1024, log::LevelFilter::Trace, driver, Handler);
-}
-
-enum ControllerCommand {
-    MoveTo([f32; 3], f32),
-    Stop,
-}
-
-#[embassy_executor::task]
-async fn step_consumer(mut sm0: StateMachine<'static, pPIO0, 0>, dma0: peripherals::DMA_CH0) {
-    log::info!("Step consumer started");
-
-    let mut dma0_ref = dma0.into_ref();
-
-    log::info!("Got DMA ref");
+    let mut dma0_ref = r.step_dma0.into_ref();
 
     let mut buffer = [0u32; 1024];
     loop {
-        log::info!("Waiting for buffer");
-
         for i in 0..buffer.len() {
             buffer[i] = STEP_CHANNEL.receive().await;
         }
 
         sm0.tx().dma_push(dma0_ref.reborrow(), &buffer).await;
+    }
+}
 
-        log::info!("Got buffer");
+#[embassy_executor::task]
+async fn motion_task() {
+    let mut machine = SystemState {
+        current_pos: [0.0; 3],
+        _current_speed: 0.0,
+    };
+
+    loop {
+        if let Ok(block) = MOTION_QUEUE.try_receive() {
+            execute_motion(&mut machine, block).await;
+        }
+
+        match CONTROLLER_CHANNEL.receive().await {
+            ControllerCommand::MoveTo(target, max_speed) => {
+                MOTION_QUEUE
+                    .send(MotionCommand::Linear(target, max_speed))
+                    .await;
+            }
+
+            ControllerCommand::Stop => {
+                log::info!("!!Stopping!!");
+            }
+        }
     }
 }
 
@@ -308,8 +263,8 @@ async fn execute_motion(machine: &mut SystemState, command: MotionCommand) {
         let step_z_mm = dz * frac;
 
         let steps_x = step_x_mm * steps_per_mm[0];
-        let steps_y = step_y_mm * steps_per_mm[1];
-        let steps_z = step_z_mm * steps_per_mm[2];
+        let _steps_y = step_y_mm * steps_per_mm[1];
+        let _steps_z = step_z_mm * steps_per_mm[2];
 
         x0 += step_x_mm;
         y0 += step_y_mm;
@@ -342,50 +297,18 @@ async fn execute_motion(machine: &mut SystemState, command: MotionCommand) {
         if steps_x_abs > 0.0 {
             STEP_CHANNEL.send(steps_x_abs as u32).await;
             STEP_CHANNEL.send(delay_cycles).await;
-
-            log::info!("Pushed steps");
         }
     }
-}
 
-#[embassy_executor::task]
-async fn controller() {
-    log::info!("Controller started");
-
-    let mut machine = SystemState {
-        current_pos: [0.0; 3],
-        current_speed: 0.0,
-    };
-
-    loop {
-        log::info!("Controller running");
-        if let Ok(block) = MOTION_QUEUE.try_receive() {
-            log::info!("Got block");
-
-            execute_motion(&mut machine, block).await;
-
-            log::info!("Done with block");
-        }
-
-        match CONTROLLER_CHANNEL.receive().await {
-            ControllerCommand::MoveTo(target, max_speed) => {
-                log::info!("!!Moving to!!");
-                MOTION_QUEUE
-                    .send(MotionCommand::Linear(target, max_speed))
-                    .await;
-                log::info!("!!Done moving!!");
-            }
-
-            ControllerCommand::Stop => {
-                log::info!("!!Stopping!!");
-            }
-        }
+    // fill rest of the buffer
+    while STEP_CHANNEL.free_capacity() > 0 {
+        STEP_CHANNEL.send(0).await;
     }
 }
 
 struct SystemState {
     current_pos: [f32; 3], // Current position of each axis
-    current_speed: f32,
+    _current_speed: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
