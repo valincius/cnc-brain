@@ -78,7 +78,7 @@ async fn controller_task(r: ControllerResources) {
     let usb_driver = embassy_rp::usb::Driver::new(r.usb, Irqs);
     spawner.spawn(usb_comm_task(usb_driver)).unwrap();
 
-    let mut led = Output::new(r.led, Level::Low);
+    // let mut led = Output::new(r.led, Level::Low);
 
     // let mut ticker = Ticker::every(Duration::from_millis(50));
     loop {

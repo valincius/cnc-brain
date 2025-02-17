@@ -1,7 +1,6 @@
 [build]
 target = "thumbv6m-none-eabi"
-rustflags = ["-Z", "threads=20"]
-# rustc-wrapper = "/usr/local/cargo/bin/sccache"
+rustflags = ["-Zthreads=8"]
 
 [target.thumbv6m-none-eabi]
 rustflags = [
@@ -12,5 +11,4 @@ rustflags = [
     "-C",
     "no-vectorize-loops",
 ]
-
 runner = "elf2uf2-rs"
