@@ -20,7 +20,6 @@ use embassy_rp::{
     multicore::{spawn_core1, Stack},
     rom_data::reset_to_usb_boot,
 };
-use embassy_time::{Duration, Ticker};
 
 static mut CORE1_STACK: Stack<4096> = Stack::new();
 

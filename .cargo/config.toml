@@ -1,12 +1,10 @@
 [build]
 target = "thumbv6m-none-eabi"
-rustflags = ["-Z", "threads=8"]
+rustflags = ["-Z", "threads=20"]
 # rustc-wrapper = "/usr/local/cargo/bin/sccache"
 
 [target.thumbv6m-none-eabi]
 rustflags = [
-    "-Z",
-    "threads=8",
     "-C",
     "link-arg=--nmagic",
     "-C",
