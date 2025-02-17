@@ -2,7 +2,7 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
-use cnc_brain::motion::{motion_task, MotionCommand, MOTION_QUEUE};
+use cnc_brain::motion::{motion_task, MotionCommand, MOTION_QUEUE, MOTION_STATE};
 use cnc_brain::receiver::usb_comm_task;
 use cnc_brain::{
     split_resources, AssignedResources, ControllerCommand, ControllerResources, Irqs,
@@ -81,11 +81,15 @@ async fn controller_task(r: ControllerResources) {
 
     let mut led = Output::new(r.led, Level::Low);
 
-    let mut ticker = Ticker::every(Duration::from_millis(50));
+    // let mut ticker = Ticker::every(Duration::from_millis(50));
     loop {
-        led.toggle();
+        // led.toggle();
 
-        ticker.next().await;
+        let state = MOTION_STATE.wait().await;
+
+        log::info!("Motion state: {:?}", state);
+
+        // ticker.next().await;
     }
 }
 

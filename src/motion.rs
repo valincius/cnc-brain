@@ -7,6 +7,7 @@ use embassy_rp::{
 use embassy_sync::{
     blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
     channel::Channel,
+    signal::Signal,
     zerocopy_channel::{Channel as ZChannel, Receiver, Sender},
 };
 use fixed::traits::ToFixed as _;
@@ -17,6 +18,7 @@ use crate::{Irqs, StepperResources};
 
 type StepBuffer = [u32; 512];
 
+pub static MOTION_STATE: Signal<CriticalSectionRawMutex, MotionState> = Signal::new();
 pub static MOTION_QUEUE: Channel<CriticalSectionRawMutex, MotionCommand, 128> = Channel::new();
 
 #[embassy_executor::task]
@@ -35,9 +37,9 @@ pub async fn motion_task(stepper_resources: StepperResources) {
 
     spawner.must_spawn(stepper_task(stepper_resources, receiver));
 
-    let mut machine = SystemState {
+    let mut machine = MotionState {
         current_pos: [0.0; 3],
-        _current_speed: 0.0,
+        current_speed: 0.0,
     };
 
     loop {
@@ -109,7 +111,7 @@ async fn stepper_task(
 
 async fn execute_motion(
     sender: &mut Sender<'static, NoopRawMutex, StepBuffer>,
-    machine: &mut SystemState,
+    state: &mut MotionState,
     command: MotionCommand,
 ) {
     let accel = 100_000.0f32;
@@ -123,7 +125,7 @@ async fn execute_motion(
         steps_per_mm[2] * micro_steps as f32,
     ];
 
-    let [mut x0, mut y0, mut z0] = machine.current_pos;
+    let [mut x0, mut y0, mut z0] = &state.current_pos;
 
     let (x1, y1, z1, feed_rate) = match command {
         MotionCommand::Linear([x, y, z], feed_rate) => (x, y, z, feed_rate),
@@ -166,6 +168,8 @@ async fn execute_motion(
                 }
             }
         }
+
+        state.current_speed = current_vel;
 
         let delta_dist = current_vel * dt;
         traveled += delta_dist;
@@ -221,6 +225,8 @@ async fn execute_motion(
             sender.send_done();
             step_index = 0;
         }
+
+        MOTION_STATE.signal(state.clone());
     }
 
     if step_index > 0 {
@@ -228,12 +234,13 @@ async fn execute_motion(
     }
 }
 
-struct SystemState {
+#[derive(Debug, Clone)]
+pub struct MotionState {
     current_pos: [f32; 3], // Current position of each axis
-    _current_speed: f32,
+    current_speed: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub enum MotionCommand {
     Linear([f32; 3], f32),
 }
