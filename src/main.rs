@@ -5,10 +5,10 @@
 use cnc_brain::receiver::usb_comm_task;
 use cnc_brain::{ControllerCommand, CONTROLLER_CHANNEL};
 
-use cortex_m_rt::{entry, exception};
-use embassy_rp::dma::Channel as _;
+use cortex_m_rt::entry;
 use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_sync::channel::Channel;
+use embassy_sync::zerocopy_channel::{Receiver, Sender};
 use static_cell::StaticCell;
 
 use assign_resources::assign_resources;
@@ -23,9 +23,9 @@ use embassy_rp::{
     pio::Pio,
     rom_data::reset_to_usb_boot,
 };
-use embassy_rp::{peripherals, Peripheral as _};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_rp::{peripherals, Peripheral};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
+use embassy_time::{Duration, Ticker};
 use fixed::traits::ToFixed;
 use libm::{fabsf, floorf, hypotf};
 
@@ -36,7 +36,6 @@ static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 static EXECUTOR_HI: InterruptExecutor = InterruptExecutor::new();
 
 static MOTION_QUEUE: Channel<CriticalSectionRawMutex, MotionCommand, 128> = Channel::new();
-static STEP_CHANNEL: Channel<CriticalSectionRawMutex, u32, 1024> = Channel::new();
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<pPIO0>;
@@ -49,7 +48,7 @@ assign_resources! {
         led: PIN_25,
     }
 
-    for_motion: MotionResources {
+    for_motion: StepperResources {
         pio: PIO0,
         x_step: PIN_0,
         x_dir: PIN_1,
@@ -79,7 +78,7 @@ fn main() -> ! {
 
     interrupt::SWI_IRQ_0.set_priority(Priority::P3);
     let spawner = EXECUTOR_HI.start(interrupt::SWI_IRQ_0);
-    spawner.must_spawn(stepper_task(r.for_motion));
+    spawner.must_spawn(motion_task(r.for_motion));
 
     let executor0 = EXECUTOR0.init(Executor::new());
     executor0.run(|spawner| spawner.must_spawn(main_task()));
@@ -87,15 +86,18 @@ fn main() -> ! {
 
 #[embassy_executor::task]
 async fn main_task() {
-    let spawner = Spawner::for_current_executor().await;
-
-    spawner.must_spawn(motion_task());
-
-    let mut ticker = Ticker::every(Duration::from_secs(5));
     loop {
-        log::info!("Core 0 running");
+        match CONTROLLER_CHANNEL.receive().await {
+            ControllerCommand::MoveTo(target, max_speed) => {
+                MOTION_QUEUE
+                    .send(MotionCommand::Linear(target, max_speed))
+                    .await;
+            }
 
-        ticker.next().await;
+            ControllerCommand::Stop => {
+                log::info!("!!Stopping!!");
+            }
+        }
     }
 }
 
@@ -116,8 +118,13 @@ async fn controller_task(r: ControllerResources) {
     }
 }
 
+type StepBuffer = [u32; 512];
+
 #[embassy_executor::task]
-async fn stepper_task(r: MotionResources) {
+async fn stepper_task(
+    r: StepperResources,
+    mut receiver: Receiver<'static, NoopRawMutex, StepBuffer>,
+) {
     let Pio {
         mut common,
         mut sm0,
@@ -150,7 +157,9 @@ async fn stepper_task(r: MotionResources) {
 
     let stepper_prog = common.load_program(&stepper_prog.program);
 
+    // let x_step = Output::new(x_step, Level::Low);
     let x_step = common.make_pio_pin(r.x_step);
+
     let _x_dir = Output::new(r.x_dir, Level::Low);
 
     let mut step_pio_cfg = Config::default();
@@ -161,45 +170,51 @@ async fn stepper_task(r: MotionResources) {
     sm0.set_config(&step_pio_cfg);
     sm0.set_enable(true);
 
-    let mut dma0_ref = r.step_dma0.into_ref();
+    let mut dma_ref = r.step_dma0.into_ref();
 
-    let mut buffer = [0u32; 1024];
     loop {
-        for i in 0..buffer.len() {
-            buffer[i] = STEP_CHANNEL.receive().await;
-        }
+        let buffer = receiver.receive().await;
 
-        sm0.tx().dma_push(dma0_ref.reborrow(), &buffer).await;
+        sm0.tx().dma_push(dma_ref.reborrow(), buffer).await;
+
+        receiver.receive_done();
     }
 }
 
 #[embassy_executor::task]
-async fn motion_task() {
+async fn motion_task(stepper_resources: StepperResources) {
+    let spawner = Spawner::for_current_executor().await;
+
+    const BLOCK_SIZE: usize = 512;
+    const NUM_BLOCKS: usize = 2;
+
+    static BUF: StaticCell<[StepBuffer; NUM_BLOCKS]> = StaticCell::new();
+    let buf = BUF.init([[0; BLOCK_SIZE]; NUM_BLOCKS]);
+
+    static CHANNEL: StaticCell<
+        embassy_sync::zerocopy_channel::Channel<'_, NoopRawMutex, StepBuffer>,
+    > = StaticCell::new();
+    let channel = CHANNEL.init(embassy_sync::zerocopy_channel::Channel::new(buf));
+    let (mut sender, receiver) = channel.split();
+
+    spawner.must_spawn(stepper_task(stepper_resources, receiver));
+
     let mut machine = SystemState {
         current_pos: [0.0; 3],
         _current_speed: 0.0,
     };
 
     loop {
-        if let Ok(block) = MOTION_QUEUE.try_receive() {
-            execute_motion(&mut machine, block).await;
-        }
-
-        match CONTROLLER_CHANNEL.receive().await {
-            ControllerCommand::MoveTo(target, max_speed) => {
-                MOTION_QUEUE
-                    .send(MotionCommand::Linear(target, max_speed))
-                    .await;
-            }
-
-            ControllerCommand::Stop => {
-                log::info!("!!Stopping!!");
-            }
-        }
+        let block = MOTION_QUEUE.receive().await;
+        execute_motion(&mut sender, &mut machine, block).await;
     }
 }
 
-async fn execute_motion(machine: &mut SystemState, command: MotionCommand) {
+async fn execute_motion(
+    sender: &mut Sender<'static, NoopRawMutex, StepBuffer>,
+    machine: &mut SystemState,
+    command: MotionCommand,
+) {
     let accel = 100_000.0f32;
 
     let micro_steps = 16;
@@ -232,6 +247,8 @@ async fn execute_motion(machine: &mut SystemState, command: MotionCommand) {
     let epsilon = 0.001; // mm
 
     let mut delay_accum: f32 = 0.0;
+
+    let mut step_index = 0;
 
     while traveled < distance - epsilon {
         let dist_left = distance - traveled;
@@ -294,15 +311,23 @@ async fn execute_motion(machine: &mut SystemState, command: MotionCommand) {
         // Subtract the integer part, leaving the fractional remainder
         delay_accum -= delay_cycles as f32;
 
+        let buf = sender.send().await;
+
         if steps_x_abs > 0.0 {
-            STEP_CHANNEL.send(steps_x_abs as u32).await;
-            STEP_CHANNEL.send(delay_cycles).await;
+            buf[step_index] = delay_cycles;
+            buf[step_index + 1] = steps_x_abs as u32;
+
+            step_index += 2;
+        }
+
+        if step_index >= buf.len() {
+            sender.send_done();
+            step_index = 0;
         }
     }
 
-    // fill rest of the buffer
-    while STEP_CHANNEL.free_capacity() > 0 {
-        STEP_CHANNEL.send(0).await;
+    if step_index > 0 {
+        sender.send_done();
     }
 }
 

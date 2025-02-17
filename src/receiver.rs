@@ -14,9 +14,11 @@ impl ReceiverHandler for Handler {
             if let Some(cmd) = parts.next() {
                 match cmd {
                     "go" => {
+                        log::info!("Go command received");
                         CONTROLLER_CHANNEL
                             .send(ControllerCommand::MoveTo([250.0, 250.0, 250.0], 7500.0))
                             .await;
+                        log::info!("Go command done");
                     }
                     "stop" => {
                         CONTROLLER_CHANNEL.send(ControllerCommand::Stop).await;
