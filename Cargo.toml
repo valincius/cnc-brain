@@ -21,6 +21,8 @@ pio = "0.2"
 assign-resources = "0.4.1"
 libm = "0.2.11"
 portable-atomic = { version = "1.5", features = ["critical-section"] }
+embassy-time = "0.4.0"
+embassy-futures = "0.1.1"
 
 [profile.dev]
 opt-level = 3

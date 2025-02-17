@@ -2,7 +2,7 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
-use cnc_brain::motion::{motion_task, MotionCommand, MOTION_QUEUE, MOTION_STATE};
+use cnc_brain::motion::{motion_task, MotionCommand, MOTION_QUEUE, MOTION_SIGNAL, STOP_SIGNAL};
 use cnc_brain::receiver::usb_comm_task;
 use cnc_brain::{
     split_resources, AssignedResources, ControllerCommand, ControllerResources, Irqs,
@@ -10,16 +10,15 @@ use cnc_brain::{
 };
 
 use cortex_m_rt::entry;
-use static_cell::StaticCell;
-
 use embassy_executor::{Executor, InterruptExecutor, Spawner};
 use embassy_rp::{
-    gpio::{Level, Output},
     interrupt,
     interrupt::{InterruptExt as _, Priority},
     multicore::{spawn_core1, Stack},
     rom_data::reset_to_usb_boot,
 };
+use embassy_time::Timer;
+use static_cell::StaticCell;
 
 static mut CORE1_STACK: Stack<4096> = Stack::new();
 
@@ -65,7 +64,7 @@ async fn main_task() {
             }
 
             ControllerCommand::Stop => {
-                log::info!("!!Stopping!!");
+                STOP_SIGNAL.signal(());
             }
         }
     }
@@ -78,17 +77,11 @@ async fn controller_task(r: ControllerResources) {
     let usb_driver = embassy_rp::usb::Driver::new(r.usb, Irqs);
     spawner.spawn(usb_comm_task(usb_driver)).unwrap();
 
-    // let mut led = Output::new(r.led, Level::Low);
-
-    // let mut ticker = Ticker::every(Duration::from_millis(50));
     loop {
-        // led.toggle();
-
-        let state = MOTION_STATE.wait().await;
-
+        let state = MOTION_SIGNAL.wait().await;
         log::info!("Motion state: {:?}", state);
 
-        // ticker.next().await;
+        Timer::after_secs(1).await;
     }
 }
 
