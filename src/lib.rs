@@ -34,7 +34,9 @@ assign_resources! {
         pio: PIO0,
         x_step: PIN_0,
         x_dir: PIN_1,
-
-        step_dma0: DMA_CH0,
+        y_step: PIN_2,
+        y_dir: PIN_3,
+        z_step: PIN_4,
+        z_dir: PIN_5,
     }
 }

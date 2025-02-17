@@ -21,7 +21,25 @@ pub static STOP_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static MOTION_SIGNAL: Signal<CriticalSectionRawMutex, MotionState> = Signal::new();
 pub static MOTION_QUEUE: Channel<CriticalSectionRawMutex, MotionCommand, 128> = Channel::new();
 
-pub async fn execute_motion(sm0: &mut StateMachine<'_, PIO0, 0>, command: MotionCommand) {
+#[embassy_executor::task]
+pub async fn motion_task(r: StepperResources) {
+    let mut io = MotionIO::from(r);
+
+    loop {
+        let command = MOTION_QUEUE.receive().await;
+
+        match select::select(execute_motion(&mut io, command), STOP_SIGNAL.wait()).await {
+            select::Either::First(_) => {
+                log::info!("Motion done");
+            }
+            select::Either::Second(_) => {
+                log::info!("Motion stopped");
+            }
+        }
+    }
+}
+
+async fn execute_motion(io: &mut MotionIO<'_>, command: MotionCommand) {
     let mut state = { CURRENT_STATE.lock().await.borrow().clone() };
 
     let accel = 100_000.0f32;
@@ -99,9 +117,23 @@ pub async fn execute_motion(sm0: &mut StateMachine<'_, PIO0, 0>, command: Motion
         state.current_speed = current_vel;
         state.current_pos = [x0, y0, z0];
 
-        let _dir_x = if steps_x >= 0.0f32 { 1 } else { 0 };
-        let _dir_y = if steps_y >= 0.0f32 { 1 } else { 0 };
-        let _dir_z = if steps_z >= 0.0f32 { 1 } else { 0 };
+        io.dirx.set_level(if steps_x >= 0.0f32 {
+            Level::High
+        } else {
+            Level::Low
+        });
+
+        io.diry.set_level(if steps_y >= 0.0f32 {
+            Level::High
+        } else {
+            Level::Low
+        });
+
+        io.dirz.set_level(if steps_z >= 0.0f32 {
+            Level::High
+        } else {
+            Level::Low
+        });
 
         let steps_x_abs = fabsf(steps_x);
         let steps_y_abs = fabsf(steps_y);
@@ -128,8 +160,18 @@ pub async fn execute_motion(sm0: &mut StateMachine<'_, PIO0, 0>, command: Motion
         delay_accum_z -= delay_cycles_z as f32;
 
         if steps_x_abs > 0.0 {
-            sm0.tx().wait_push(steps_x_abs as u32).await;
-            sm0.tx().wait_push(delay_cycles_x).await;
+            io.smx.tx().wait_push(steps_x_abs as u32).await;
+            io.smx.tx().wait_push(delay_cycles_x).await;
+        }
+
+        if steps_y_abs > 0.0 {
+            io.smy.tx().wait_push(steps_y_abs as u32).await;
+            io.smy.tx().wait_push(delay_cycles_y).await;
+        }
+
+        if steps_z_abs > 0.0 {
+            io.smz.tx().wait_push(steps_z_abs as u32).await;
+            io.smz.tx().wait_push(delay_cycles_z).await;
         }
 
         {
@@ -140,63 +182,86 @@ pub async fn execute_motion(sm0: &mut StateMachine<'_, PIO0, 0>, command: Motion
     }
 }
 
-#[embassy_executor::task]
-pub async fn motion_task(r: StepperResources) {
-    let Pio {
-        mut common,
-        mut sm0,
-        ..
-    } = Pio::new(r.pio, Irqs);
+struct MotionIO<'a> {
+    smx: StateMachine<'a, PIO0, 0>,
+    smy: StateMachine<'a, PIO0, 1>,
+    smz: StateMachine<'a, PIO0, 2>,
 
-    let stepper_prog = pio_proc::pio_asm!(
-        "set pindirs 1"
+    dirx: Output<'a>,
+    diry: Output<'a>,
+    dirz: Output<'a>,
+}
 
-        ".wrap_target"
+impl<'a> MotionIO<'a> {
+    fn from(resources: StepperResources) -> Self {
+        let Pio {
+            mut common,
+            sm0: mut smx,
+            sm1: mut smy,
+            sm2: mut smz,
+            ..
+        } = Pio::new(resources.pio, Irqs);
 
-        "pull"
-        "mov x osr" // Set X to number of steps
-        "pull"
-        "mov y osr" // Set Y to delay between steps
-        "mov isr y" // Copy to ISR
+        let stepper_prog = pio_proc::pio_asm!(
+            "set pindirs 1"
 
-        "step:"
-        "set pins 1 [1]"
-        "set pins 0"
+            ".wrap_target"
 
-        "mov y isr" // Reload delay
-        "delay:"
-        "jmp y-- delay"
+            "pull"
+            "mov x osr" // Set X to number of steps
+            "pull"
+            "mov y osr" // Set Y to delay between steps
+            "mov isr y" // Copy to ISR
 
-        "jmp x-- step"
+            "step:"
+            "set pins 1 [1]"
+            "set pins 0"
 
-        ".wrap"
-    );
+            "mov y isr" // Reload delay
+            "delay:"
+            "jmp y-- delay"
 
-    let stepper_prog = common.load_program(&stepper_prog.program);
+            "jmp x-- step"
 
-    // let x_step = Output::new(x_step, Level::Low);
-    let x_step = common.make_pio_pin(r.x_step);
+            ".wrap"
+        );
 
-    let _x_dir = Output::new(r.x_dir, Level::Low);
+        let stepper_prog = common.load_program(&stepper_prog.program);
 
-    let mut step_pio_cfg = embassy_rp::pio::Config::default();
-    step_pio_cfg.set_set_pins(&[&x_step]);
-    step_pio_cfg.use_program(&stepper_prog, &[]);
-    step_pio_cfg.clock_divider = (104.17).to_fixed(); // 125MHz / 104.17 = 1.2MHz = we are aiming for 200khz max pulse rate (5us per pulse), each pulse is 6 cycles
+        let x_step = common.make_pio_pin(resources.x_step);
+        let y_step = common.make_pio_pin(resources.y_step);
+        let z_step = common.make_pio_pin(resources.z_step);
 
-    sm0.set_config(&step_pio_cfg);
-    sm0.set_enable(true);
+        let mut cfgx = embassy_rp::pio::Config::default();
+        cfgx.use_program(&stepper_prog, &[]);
+        cfgx.clock_divider = (104.17).to_fixed(); // 125MHz / 104.17 = 1.2MHz = we are aiming for 200khz max pulse rate (5us per pulse), each pulse is 6 cycles
+        cfgx.set_set_pins(&[&x_step]);
+        smx.set_config(&cfgx);
 
-    loop {
-        let command = MOTION_QUEUE.receive().await;
+        let mut cfgy = embassy_rp::pio::Config::default();
+        cfgy.use_program(&stepper_prog, &[]);
+        cfgy.clock_divider = (104.17).to_fixed(); // 125MHz / 104.17 = 1.2MHz = we are aiming for 200khz max pulse rate (5us per pulse), each pulse is 6 cycles
+        cfgy.set_set_pins(&[&y_step]);
+        smy.set_config(&cfgy);
 
-        match select::select(execute_motion(&mut sm0, command), STOP_SIGNAL.wait()).await {
-            select::Either::First(_) => {
-                log::info!("Motion done");
-            }
-            select::Either::Second(_) => {
-                log::info!("Motion stopped");
-            }
+        let mut cfgz = embassy_rp::pio::Config::default();
+        cfgz.use_program(&stepper_prog, &[]);
+        cfgz.clock_divider = (104.17).to_fixed(); // 125MHz / 104.17 = 1.2MHz = we are aiming for 200khz max pulse rate (5us per pulse), each pulse is 6 cycles
+        cfgz.set_set_pins(&[&z_step]);
+        smz.set_config(&cfgz);
+
+        smx.set_enable(true);
+        smy.set_enable(true);
+        smz.set_enable(true);
+
+        Self {
+            dirx: Output::new(resources.x_dir, Level::Low),
+            diry: Output::new(resources.y_dir, Level::Low),
+            dirz: Output::new(resources.z_dir, Level::Low),
+
+            smx,
+            smy,
+            smz,
         }
     }
 }
