@@ -1,85 +1,93 @@
-use std::time::Duration;
+#![no_std]
+#![no_main]
+#![feature(impl_trait_in_assoc_type)]
 
-use cnc_brain::{runner::MachineState, Coordinates, Motion};
-use tokio::time::sleep;
+use cnc_brain::motion::{motion_task, MotionCommand, MOTION_QUEUE, MOTION_SIGNAL, STOP_SIGNAL};
+use cnc_brain::receiver::usb_comm_task;
+use cnc_brain::{
+    split_resources, AssignedResources, ControllerCommand, ControllerResources, Irqs,
+    StepperResources, CONTROLLER_CHANNEL,
+};
 
-#[tokio::main]
-async fn main() {
-    let program = &vec![
-        Motion::Linear {
-            feedrate: 100.0,
-            coords: Coordinates {
-                x: Some(150.0),
-                y: Some(150.0),
-                z: Some(0.0),
-            },
-        },
-        Motion::Linear {
-            feedrate: 100.0,
-            coords: Coordinates {
-                x: Some(158.0),
-                y: Some(253.0),
-                z: Some(0.0),
-            },
-        },
-        Motion::Linear {
-            feedrate: 100.0,
-            coords: Coordinates {
-                x: Some(200.0),
-                y: Some(253.0),
-                z: Some(0.0),
-            },
-        },
-        Motion::Linear {
-            feedrate: 100.0,
-            coords: Coordinates {
-                x: Some(200.0),
-                y: Some(260.0),
-                z: Some(0.0),
-            },
-        },
-        Motion::Linear {
-            feedrate: 100.0,
-            coords: Coordinates {
-                x: Some(200.0),
-                y: Some(275.0),
-                z: Some(0.0),
-            },
-        },
-        Motion::Linear {
-            feedrate: 100.0,
-            coords: Coordinates {
-                x: Some(220.0),
-                y: Some(280.0),
-                z: Some(0.0),
-            },
-        },
-    ];
+use cortex_m_rt::entry;
+use embassy_executor::{Executor, InterruptExecutor, Spawner};
+use embassy_rp::{
+    interrupt,
+    interrupt::{InterruptExt as _, Priority},
+    multicore::{spawn_core1, Stack},
+    rom_data::reset_to_usb_boot,
+};
+use embassy_time::Timer;
+use static_cell::StaticCell;
 
-    // println!("{:#?}", program);
-    // return;
+static mut CORE1_STACK: Stack<4096> = Stack::new();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
+static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
+static EXECUTOR_HI: InterruptExecutor = InterruptExecutor::new();
 
-    tx.send(Command::Movement(program.clone())).await.unwrap();
+#[interrupt]
+unsafe fn SWI_IRQ_0() {
+    EXECUTOR_HI.on_interrupt()
+}
 
-    let mut machine = MachineState::default();
+#[entry]
+fn main() -> ! {
+    let p = embassy_rp::init(Default::default());
+    let r = split_resources!(p);
+
+    spawn_core1(
+        p.CORE1,
+        unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
+        move || {
+            let executor1 = EXECUTOR1.init(Executor::new());
+            executor1.run(|spawner| spawner.must_spawn(controller_task(r.for_controller)));
+        },
+    );
+
+    interrupt::SWI_IRQ_0.set_priority(Priority::P3);
+    let spawner = EXECUTOR_HI.start(interrupt::SWI_IRQ_0);
+    spawner.must_spawn(motion_task(r.for_motion));
+
+    let executor0 = EXECUTOR0.init(Executor::new());
+    executor0.run(|spawner| spawner.must_spawn(main_task()));
+}
+
+#[embassy_executor::task]
+async fn main_task() {
     loop {
-        if let Ok(command) = rx.try_recv() {
-            match command {
-                Command::Movement(movement) => {
-                    machine.queue_motion(movement);
-                }
+        match CONTROLLER_CHANNEL.receive().await {
+            ControllerCommand::MoveTo(target, max_speed) => {
+                MOTION_QUEUE
+                    .send(MotionCommand::Linear(target, max_speed))
+                    .await;
+            }
+
+            ControllerCommand::Stop => {
+                STOP_SIGNAL.signal(());
             }
         }
-
-        machine.tick().await;
-
-        sleep(Duration::from_millis(50)).await;
     }
 }
 
-#[derive(Debug)]
-enum Command {
-    Movement(Vec<Motion>),
+#[embassy_executor::task]
+async fn controller_task(r: ControllerResources) {
+    let spawner = Spawner::for_current_executor().await;
+
+    let usb_driver = embassy_rp::usb::Driver::new(r.usb, Irqs);
+    spawner.spawn(usb_comm_task(usb_driver)).unwrap();
+
+    loop {
+        let state = MOTION_SIGNAL.wait().await;
+        log::info!("Motion state: {:?}", state);
+
+        Timer::after_secs(1).await;
+    }
+}
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    reset_to_usb_boot(0, 0); // Restart the chip
+
+    loop {}
 }

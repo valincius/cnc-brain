@@ -1,0 +1,14 @@
+[build]
+target = "thumbv6m-none-eabi"
+rustflags = ["-Zthreads=8"]
+
+[target.thumbv6m-none-eabi]
+rustflags = [
+    "-C",
+    "link-arg=--nmagic",
+    "-C",
+    "link-arg=-Tlink.x",
+    "-C",
+    "no-vectorize-loops",
+]
+runner = "elf2uf2-rs"
