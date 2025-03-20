@@ -27,8 +27,10 @@ static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 static EXECUTOR_HI: InterruptExecutor = InterruptExecutor::new();
 
 #[interrupt]
-unsafe fn SWI_IRQ_0() {
-    EXECUTOR_HI.on_interrupt()
+fn SWI_IRQ_0() {
+    unsafe {
+        EXECUTOR_HI.on_interrupt()
+    }
 }
 
 #[entry]

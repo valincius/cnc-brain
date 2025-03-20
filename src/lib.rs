@@ -32,8 +32,8 @@ assign_resources! {
 
     for_motion: StepperResources {
         pio: PIO0,
-        x_step: PIN_0,
-        x_dir: PIN_1,
+        x_step: PIN_16,
+        x_dir: PIN_17,
         y_step: PIN_2,
         y_dir: PIN_3,
         z_step: PIN_4,
