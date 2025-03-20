@@ -10,7 +10,7 @@ use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
 };
 use fixed::traits::ToFixed as _;
-use libm::{fabsf, floorf, hypotf};
+use libm::{fabsf, floorf, hypotf, powf, sqrtf};
 
 use crate::{Irqs, StepperResources};
 
@@ -40,109 +40,178 @@ pub async fn motion_task(r: StepperResources) {
 }
 
 async fn execute_motion(io: &mut MotionIO<'_>, command: MotionCommand) {
+    // Acquire current motion state.
     let mut state = { CURRENT_STATE.lock().await.borrow().clone() };
 
-    let accel = 100_000.0f32;
+    // === Motion Profile Parameters (units: mm and s) ===
+    const MAX_ACCEL: f32 = 1_000_000.0; // Maximum acceleration (mm/s²)
+    const JERK: f32 = 500_000.0; // Jerk limit (mm/s³)
+    const DT: f32 = 0.0001; // Timestep: 100 µs
+    const EPSILON: f32 = 0.001; // Distance tolerance (mm)
 
+    // --- Boost parameters for very low speeds ---
+    const LOW_VEL_THRESHOLD: f32 = 0.01; // Below 0.01 mm/s, apply boost
+    const BOOST_FACTOR: f32 = 10.0; // Boost factor for jerk
+
+    // Micro-stepping and conversion factors.
     let micro_steps = 16;
-
-    let steps_per_mm = [267.0f32, 267.0f32, 267.0f32];
+    let base_steps = [267.0, 267.0, 267.0];
     let steps_per_mm = [
-        steps_per_mm[0] * micro_steps as f32,
-        steps_per_mm[1] * micro_steps as f32,
-        steps_per_mm[2] * micro_steps as f32,
+        base_steps[0] * micro_steps as f32,
+        base_steps[1] * micro_steps as f32,
+        base_steps[2] * micro_steps as f32,
     ];
 
+    // === Initial and Target Positions ===
     let [mut x0, mut y0, mut z0] = state.current_pos;
-
     let (x1, y1, z1, feed_rate) = match command {
         MotionCommand::Linear([x, y, z], feed_rate) => (x, y, z, feed_rate),
     };
 
+    // Compute move vector and total Euclidean distance.
     let dx = x1 - x0;
     let dy = y1 - y0;
     let dz = z1 - z0;
+    let total_distance = dist3d(x0, y0, z0, x1, y1, z1);
 
-    let distance = dist3d(x0, y0, z0, x1, y1, z1);
+    // === Motion State Variables ===
+    let mut traveled_distance = 0.0;
+    let mut current_velocity = 0.0; // mm/s
+    let target_velocity = feed_rate; // desired cruising speed (mm/s)
 
-    let mut traveled = 0.0;
-    let mut current_vel = 0.0; // or carry over from prior block
-    let max_vel = feed_rate; // in, say, mm/s
-    let dt = 0.0001; // 100us
-    let mut is_decelerating = false;
+    // S‑curve state: start with zero acceleration.
+    let mut current_acceleration = 0.0;
+    let mut deceleration_phase = false;
 
-    let epsilon = 0.001; // mm
+    // Variables for accumulating motor command delays.
+    let mut delay_accum_x = 0.0;
+    let mut delay_accum_y = 0.0;
+    let mut delay_accum_z = 0.0;
 
-    let mut delay_accum_x = 0.0f32;
-    let mut delay_accum_y = 0.0f32;
-    let mut delay_accum_z = 0.0f32;
+    // --- Helper Function for Deceleration Distance ---
+    // For a fully jerk-limited S-curve (no constant acceleration phase),
+    // the deceleration distance from a speed v is approximated by:
+    //     d_est = (4/3) * (v^(3/2)) / sqrt(j)
+    // (Units: mm)
+    fn estimate_decel_distance(vel: f32, jerk: f32) -> f32 {
+        (4.0 / 3.0) * powf(vel, 1.5) / sqrtf(jerk)
+    }
 
-    while traveled < distance - epsilon {
-        let dist_left = distance - traveled;
+    // Clamp function.
+    fn clamp(val: f32, min: f32, max: f32) -> f32 {
+        if val < min {
+            min
+        } else if val > max {
+            max
+        } else {
+            val
+        }
+    }
 
-        if is_decelerating {
-            current_vel -= accel * dt;
-            if current_vel < 0.0 {
-                break;
+    // === Main Motion Loop ===
+    while traveled_distance < total_distance - EPSILON {
+        let distance_remaining = total_distance - traveled_distance;
+
+        // Trigger deceleration when the remaining distance is less than the
+        // estimated deceleration distance.
+        if estimate_decel_distance(current_velocity, JERK) >= distance_remaining {
+            deceleration_phase = true;
+        }
+
+        // --- Determine Effective Jerk ---
+        let effective_jerk = if current_velocity < LOW_VEL_THRESHOLD {
+            JERK * BOOST_FACTOR
+        } else {
+            JERK
+        };
+
+        // --- Update Acceleration ---
+        if deceleration_phase {
+            // Compute the estimated deceleration distance.
+            let decel_est = estimate_decel_distance(current_velocity, JERK);
+            // Compute a ratio (0 if at the start of deceleration, approaching 1 as we near the end).
+            let ratio = clamp(1.0 - (distance_remaining / decel_est), 0.0, 1.0);
+            // Desired acceleration scales linearly from 0 to full deceleration.
+            let desired_accel = -MAX_ACCEL * ratio;
+            // Gradually update current acceleration toward desired_accel.
+            if current_acceleration > desired_accel {
+                current_acceleration -= effective_jerk * DT;
+                if current_acceleration < desired_accel {
+                    current_acceleration = desired_accel;
+                }
+            } else {
+                current_acceleration += effective_jerk * DT;
+                if current_acceleration > desired_accel {
+                    current_acceleration = desired_accel;
+                }
             }
         } else {
-            let decel_dist = (current_vel * current_vel) / (2.0 * accel);
-            if decel_dist >= dist_left {
-                is_decelerating = true;
-            } else if current_vel < max_vel {
-                current_vel += accel * dt;
-                if current_vel > max_vel {
-                    current_vel = max_vel;
-                }
+            // Acceleration phase: ramp up normally.
+            current_acceleration += effective_jerk * DT;
+            if current_acceleration > MAX_ACCEL {
+                current_acceleration = MAX_ACCEL;
             }
         }
 
-        let delta_dist = current_vel * dt;
-        traveled += delta_dist;
+        // --- Update Velocity ---
+        current_velocity += current_acceleration * DT;
+        if current_velocity > target_velocity {
+            current_velocity = target_velocity;
+            current_acceleration = 0.0; // Maintain cruise speed.
+        }
+        // (Do not force current_velocity to zero—allow it to approach zero smoothly.)
+        // if current_velocity < 0.0 { current_velocity = 0.0; }  <-- removed for smooth deceleration
 
-        let frac = delta_dist / distance;
+        // --- Update Position ---
+        let delta_distance = current_velocity * DT;
+        traveled_distance += delta_distance;
+        // Fraction of the total move for this timestep.
+        let step_fraction = delta_distance / total_distance;
+        let step_x_mm = dx * step_fraction;
+        let step_y_mm = dy * step_fraction;
+        let step_z_mm = dz * step_fraction;
 
-        let step_x_mm = dx * frac;
-        let step_y_mm = dy * frac;
-        let step_z_mm = dz * frac;
-
+        // Convert move (mm) to steps.
         let steps_x = step_x_mm * steps_per_mm[0];
         let steps_y = step_y_mm * steps_per_mm[1];
         let steps_z = step_z_mm * steps_per_mm[2];
 
+        // Update positions.
         x0 += step_x_mm;
         y0 += step_y_mm;
         z0 += step_z_mm;
 
-        state.current_speed = current_vel;
+        state.current_speed = current_velocity;
         state.current_pos = [x0, y0, z0];
 
-        io.dirx.set_level(if steps_x >= 0.0f32 {
+        // --- Motor IO ---
+        // Set motor directions.
+        io.dirx.set_level(if steps_x >= 0.0 {
+            Level::High
+        } else {
+            Level::Low
+        });
+        io.diry.set_level(if steps_y >= 0.0 {
+            Level::High
+        } else {
+            Level::Low
+        });
+        io.dirz.set_level(if steps_z >= 0.0 {
             Level::High
         } else {
             Level::Low
         });
 
-        io.diry.set_level(if steps_y >= 0.0f32 {
-            Level::High
-        } else {
-            Level::Low
-        });
+        // Compute absolute step values and step rates.
+        let abs_steps_x = fabsf(steps_x);
+        let abs_steps_y = fabsf(steps_y);
+        let abs_steps_z = fabsf(steps_z);
 
-        io.dirz.set_level(if steps_z >= 0.0f32 {
-            Level::High
-        } else {
-            Level::Low
-        });
+        let rate_x = abs_steps_x / DT; // steps/s
+        let rate_y = abs_steps_y / DT;
+        let rate_z = abs_steps_z / DT;
 
-        let steps_x_abs = fabsf(steps_x);
-        let steps_y_abs = fabsf(steps_y);
-        let steps_z_abs = fabsf(steps_z);
-
-        let rate_x = (steps_x_abs as f32) / dt; // steps/s
-        let rate_y = (steps_y_abs as f32) / dt; // steps/s
-        let rate_z = (steps_z_abs as f32) / dt; // steps/s
-
+        // Compute delay periods (hardware-specific constants).
         let step_period_x = (1200 * 200_000) as f32 / rate_x;
         let step_period_y = (1200 * 200_000) as f32 / rate_y;
         let step_period_z = (1200 * 200_000) as f32 / rate_z;
@@ -159,25 +228,22 @@ async fn execute_motion(io: &mut MotionIO<'_>, command: MotionCommand) {
         let delay_cycles_z = floorf(delay_accum_z) as u32;
         delay_accum_z -= delay_cycles_z as f32;
 
-        if steps_x_abs > 0.0 {
-            io.smx.tx().wait_push(steps_x_abs as u32).await;
+        if abs_steps_x > 0.0 {
+            io.smx.tx().wait_push(abs_steps_x as u32).await;
             io.smx.tx().wait_push(delay_cycles_x).await;
         }
-
-        if steps_y_abs > 0.0 {
-            io.smy.tx().wait_push(steps_y_abs as u32).await;
+        if abs_steps_y > 0.0 {
+            io.smy.tx().wait_push(abs_steps_y as u32).await;
             io.smy.tx().wait_push(delay_cycles_y).await;
         }
-
-        if steps_z_abs > 0.0 {
-            io.smz.tx().wait_push(steps_z_abs as u32).await;
+        if abs_steps_z > 0.0 {
+            io.smz.tx().wait_push(abs_steps_z as u32).await;
             io.smz.tx().wait_push(delay_cycles_z).await;
         }
 
         {
             CURRENT_STATE.lock().await.replace(state.clone());
         }
-
         MOTION_SIGNAL.signal(state.clone());
     }
 }

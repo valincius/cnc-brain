@@ -5,9 +5,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Document</title>
+    
     <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.min.js"></script>
     <script src="sketch.js"></script>
-
+    
     <style>
         body {
             overflow: hidden;
@@ -18,7 +19,72 @@
 </head>
 
 <body>
-
+    <button id="button">Connect</button>
+    <button id="go">Go</button>
+    <button id="reset">Reset</button>
 </body>
+
+<script>
+    let writer = null;
+    let reader = null;
+
+    function rsDbgToJson(rustStr) {
+        const innerStr = rustStr.replace(/^[^{]*{/, '{').replace(/}[^}]*$/, '}');
+        const jsonStr = innerStr.replace(/(\w+):/g, '"$1":');
+        return JSON.parse(jsonStr);
+    }
+
+    button.addEventListener("click", async () => {
+        try {
+            const port = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0xc0de }] });
+
+            await port.open({ baudRate: 115200 });
+
+            writer = port.writable.getWriter();
+            reader = port.readable.getReader();
+
+            console.log("Connected");
+
+            let line = '';
+
+            while (true) {
+                const { value, done } = await reader.read();
+
+                if (done) {
+                    break;
+                }
+
+                line += new TextDecoder().decode(value);
+
+                if (line.endsWith("\n")) {
+                    if (line.startsWith('motion_state=')) {
+                        const state = line.split('=')[1].trim();
+
+                        onMotion(rsDbgToJson(state));
+                    } else {
+                        console.log(line);
+                    }
+
+                    line = '';
+                }
+            }
+        } catch (e) {
+            console.error(e);
+        }
+    });
+
+    go.addEventListener("click", async () => {
+        if (writer) {
+            await writer.write(new TextEncoder().encode("go"));
+        }
+    });
+
+    reset.addEventListener("click", async () => {
+        if (writer) {
+            await writer.write(new TextEncoder().encode("q"));
+        }
+    });
+
+</script>
 
 </html>

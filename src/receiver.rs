@@ -1,7 +1,7 @@
 use embassy_rp::rom_data::reset_to_usb_boot;
 use embassy_usb_logger::ReceiverHandler;
 
-use crate::{ControllerCommand, CONTROLLER_CHANNEL};
+use crate::{CONTROLLER_CHANNEL, ControllerCommand};
 
 struct Handler;
 

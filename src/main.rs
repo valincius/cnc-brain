@@ -2,11 +2,11 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
-use cnc_brain::motion::{motion_task, MotionCommand, MOTION_QUEUE, MOTION_SIGNAL, STOP_SIGNAL};
+use cnc_brain::motion::{MOTION_QUEUE, MOTION_SIGNAL, MotionCommand, STOP_SIGNAL, motion_task};
 use cnc_brain::receiver::usb_comm_task;
 use cnc_brain::{
-    split_resources, AssignedResources, ControllerCommand, ControllerResources, Irqs,
-    StepperResources, CONTROLLER_CHANNEL,
+    AssignedResources, CONTROLLER_CHANNEL, ControllerCommand, ControllerResources, Irqs,
+    StepperResources, split_resources,
 };
 
 use cortex_m_rt::entry;
@@ -14,7 +14,7 @@ use embassy_executor::{Executor, InterruptExecutor, Spawner};
 use embassy_rp::{
     interrupt,
     interrupt::{InterruptExt as _, Priority},
-    multicore::{spawn_core1, Stack},
+    multicore::{Stack, spawn_core1},
     rom_data::reset_to_usb_boot,
 };
 use embassy_time::Timer;
@@ -28,9 +28,7 @@ static EXECUTOR_HI: InterruptExecutor = InterruptExecutor::new();
 
 #[interrupt]
 fn SWI_IRQ_0() {
-    unsafe {
-        EXECUTOR_HI.on_interrupt()
-    }
+    unsafe { EXECUTOR_HI.on_interrupt() }
 }
 
 #[entry]
@@ -81,9 +79,9 @@ async fn controller_task(r: ControllerResources) {
 
     loop {
         let state = MOTION_SIGNAL.wait().await;
-        log::info!("Motion state: {:?}", state);
+        log::info!("motion_state={:?}", state);
 
-        Timer::after_secs(1).await;
+        Timer::after_millis(50).await;
     }
 }
 
