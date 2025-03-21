@@ -75,7 +75,7 @@
 
     go.addEventListener("click", async () => {
         if (writer) {
-            await writer.write(new TextEncoder().encode("go"));
+            await writer.write(new TextEncoder().encode("go 100 100 200 1000"));
         }
     });
 

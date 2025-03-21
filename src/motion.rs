@@ -21,6 +21,39 @@ pub static STOP_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static MOTION_SIGNAL: Signal<CriticalSectionRawMutex, MotionState> = Signal::new();
 pub static MOTION_QUEUE: Channel<CriticalSectionRawMutex, MotionCommand, 128> = Channel::new();
 
+#[derive(Debug, Clone)]
+pub struct MotionState {
+    current_pos: [f32; 3], // Current position of each axis
+    current_velocity: f32,
+
+    target_pos: [f32; 3],
+    target_velocity: f32,
+
+    distance_remaining: f32,
+    current_acceleration: f32,
+    deceleration_phase: bool,
+    effective_jerk: f32,
+    traveled_distance: f32,
+}
+
+impl MotionState {
+    pub const fn new() -> Self {
+        Self {
+            current_pos: [0.0; 3],
+            current_velocity: 0.0,
+
+            target_pos: [0.0; 3],
+            target_velocity: 0.0,
+
+            distance_remaining: 0.0,
+            current_acceleration: 0.0,
+            deceleration_phase: false,
+            effective_jerk: 0.0,
+            traveled_distance: 0.0,
+        }
+    }
+}
+
 #[embassy_executor::task]
 pub async fn motion_task(r: StepperResources) {
     let mut io = MotionIO::from(r);
@@ -67,6 +100,8 @@ async fn execute_motion(io: &mut MotionIO<'_>, command: MotionCommand) {
     let (x1, y1, z1, feed_rate) = match command {
         MotionCommand::Linear([x, y, z], feed_rate) => (x, y, z, feed_rate),
     };
+
+    state.target_pos = [x1, y1, z1];
 
     // Compute move vector and total Euclidean distance.
     let dx = x1 - x0;
@@ -127,13 +162,18 @@ async fn execute_motion(io: &mut MotionIO<'_>, command: MotionCommand) {
 
         // --- Update Acceleration ---
         if deceleration_phase {
-            // Compute the estimated deceleration distance.
-            let decel_est = estimate_decel_distance(current_velocity, JERK);
-            // Compute a ratio (0 if at the start of deceleration, approaching 1 as we near the end).
-            let ratio = clamp(1.0 - (distance_remaining / decel_est), 0.0, 1.0);
-            // Desired acceleration scales linearly from 0 to full deceleration.
-            let desired_accel = -MAX_ACCEL * ratio;
-            // Gradually update current acceleration toward desired_accel.
+            // Compute the desired deceleration using the constant deceleration formula.
+            // a_desired = -v^2 / (2 * d_remaining)
+            // (Be sure to avoid division by zero.)
+            let desired_accel = if distance_remaining > EPSILON {
+                -(current_velocity * current_velocity) / (2.0 * distance_remaining)
+            } else {
+                -MAX_ACCEL
+            };
+            // Clamp desired_accel so that it doesn't exceed -MAX_ACCEL.
+            let desired_accel = clamp(desired_accel, -MAX_ACCEL, 0.0);
+
+            // Gradually update current_acceleration toward desired_accel using effective_jerk.
             if current_acceleration > desired_accel {
                 current_acceleration -= effective_jerk * DT;
                 if current_acceleration < desired_accel {
@@ -181,8 +221,15 @@ async fn execute_motion(io: &mut MotionIO<'_>, command: MotionCommand) {
         y0 += step_y_mm;
         z0 += step_z_mm;
 
-        state.current_speed = current_velocity;
+        state.current_velocity = current_velocity;
         state.current_pos = [x0, y0, z0];
+
+        state.distance_remaining = distance_remaining;
+        state.current_acceleration = current_acceleration;
+        state.deceleration_phase = deceleration_phase;
+        state.effective_jerk = effective_jerk;
+        state.traveled_distance = traveled_distance;
+        state.target_velocity = target_velocity;
 
         // --- Motor IO ---
         // Set motor directions.
@@ -268,7 +315,7 @@ impl<'a> MotionIO<'a> {
             ..
         } = Pio::new(resources.pio, Irqs);
 
-        let stepper_prog = pio_proc::pio_asm!(
+        let stepper_prog = pio::pio_asm!(
             "set pindirs 1"
 
             ".wrap_target"
@@ -328,21 +375,6 @@ impl<'a> MotionIO<'a> {
             smx,
             smy,
             smz,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct MotionState {
-    current_pos: [f32; 3], // Current position of each axis
-    current_speed: f32,
-}
-
-impl MotionState {
-    pub const fn new() -> Self {
-        Self {
-            current_pos: [0.0; 3],
-            current_speed: 0.0,
         }
     }
 }

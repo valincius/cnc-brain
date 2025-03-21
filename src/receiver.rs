@@ -14,11 +14,15 @@ impl ReceiverHandler for Handler {
             if let Some(cmd) = parts.next() {
                 match cmd {
                     "go" => {
-                        log::info!("Go command received");
+                        let x = parts.next().unwrap_or("0").parse().unwrap_or(0.0);
+                        let y = parts.next().unwrap_or("0").parse().unwrap_or(0.0);
+                        let z = parts.next().unwrap_or("0").parse().unwrap_or(0.0);
+
+                        let speed = parts.next().unwrap_or("1000").parse().unwrap_or(1000.0);
+
                         CONTROLLER_CHANNEL
-                            .send(ControllerCommand::MoveTo([250.0, 250.0, 250.0], 7500.0))
+                            .send(ControllerCommand::MoveTo([x, y, z], speed))
                             .await;
-                        log::info!("Go command done");
                     }
                     "stop" => {
                         CONTROLLER_CHANNEL.send(ControllerCommand::Stop).await;
