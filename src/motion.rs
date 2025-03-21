@@ -77,8 +77,8 @@ async fn execute_motion(io: &mut MotionIO<'_>, command: MotionCommand) {
     let mut state = { CURRENT_STATE.lock().await.borrow().clone() };
 
     // === Motion Profile Parameters (units: mm and s) ===
-    const MAX_ACCEL: f32 = 1_000_000.0; // Maximum acceleration (mm/s²)
-    const JERK: f32 = 500_000.0; // Jerk limit (mm/s³)
+    const MAX_ACCEL: f32 = 20_000.0 * 60.0 * 25.4; // Maximum acceleration (i/m²)
+    const JERK: f32 = 10_000.0 * 60.0 * 25.4; // Jerk limit (mm/s³)
     const DT: f32 = 0.0001; // Timestep: 100 µs
     const EPSILON: f32 = 0.001; // Distance tolerance (mm)
 

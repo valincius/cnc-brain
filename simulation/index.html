@@ -1,90 +1,226 @@
 <!DOCTYPE html>
 <html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Serial Communication with p5.js</title>
 
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
-    
     <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.min.js"></script>
-    <script src="sketch.js"></script>
-    
-    <style>
-        body {
-            overflow: hidden;
-            margin: 0;
-            padding: 0;
+    <script>
+      // Global variables for p5 canvas and motion state
+      let canvasWidth = window.innerWidth;
+      let canvasHeight = window.innerHeight;
+      let motionState = null;
+      let path = [];
+
+      const machine = {
+        writer: null,
+        reader: null,
+        port: null,
+      };
+
+      // p5.js functions
+      function setup() {
+        createCanvas(canvasWidth, canvasHeight);
+        syncWindow();
+      }
+
+      function windowResized() {
+        syncWindow();
+      }
+
+      function syncWindow() {
+        canvasWidth = window.innerWidth;
+        canvasHeight = window.innerHeight;
+        resizeCanvas(canvasWidth, canvasHeight);
+      }
+
+      function mousePressed() {
+        const targetX = (mouseX - canvasWidth / 2) / 1.8 / 2;
+        const targetY = (mouseY - canvasHeight / 2) / 1.8 / 2;
+
+        // Only send command if within bounds
+        if (
+          targetX < -100 ||
+          targetX > 100 ||
+          targetY < -100 ||
+          targetY > 100
+        ) {
+          return;
         }
-    </style>
-</head>
 
-<body>
-    <button id="button">Connect</button>
-    <button id="go">Go</button>
-    <button id="reset">Reset</button>
-</body>
+        if (machine?.writer) {
+          machine.writer.write(new TextEncoder().encode("stop\n"));
 
-<script>
-    let writer = null;
-    let reader = null;
+          const command = `go ${targetX} ${targetY} 0 1000\n`;
+          machine.writer.write(new TextEncoder().encode(command));
+        }
+      }
 
-    function rsDbgToJson(rustStr) {
-        const innerStr = rustStr.replace(/^[^{]*{/, '{').replace(/}[^}]*$/, '}');
+      function draw() {
+        background(0);
+        const boxSize = 200;
+        const scaleFactor = (0.8 * canvasHeight) / boxSize;
+
+        // Center the coordinate system and scale the drawing
+        translate(canvasWidth / 2, canvasHeight / 2);
+        scale(scaleFactor);
+        rectMode(CENTER);
+        strokeWeight(5 / scaleFactor);
+
+        // Draw the boundary box
+        push();
+        stroke(255);
+        noFill();
+        rect(0, 0, boxSize, boxSize);
+        pop();
+
+        // Draw the target point in blue if available
+        if (motionState?.target_pos) {
+          stroke(0, 0, 255);
+          point(motionState.target_pos[0], motionState.target_pos[1]);
+        }
+
+        // Draw path lines in white
+        for (let i = 1; i < path.length; i++) {
+          stroke(255);
+          line(path[i - 1][0], path[i - 1][1], path[i][0], path[i][1]);
+        }
+
+        // Draw the last point in red
+        if (path.length > 0) {
+          stroke(255, 0, 0);
+          point(path[path.length - 1][0], path[path.length - 1][1]);
+        }
+
+        // Draw the first point in green if exists
+        if (path.length > 1) {
+          stroke(0, 255, 0);
+          point(path[0][0], path[0][1]);
+        }
+      }
+
+      // Converts the Rust debug string to a JSON object.
+      function parseRustDebugString(rustStr) {
+        const innerStr = rustStr
+          .replace(/^[^{]*{/, "{")
+          .replace(/}[^}]*$/, "}");
         const jsonStr = innerStr.replace(/(\w+):/g, '"$1":');
         return JSON.parse(jsonStr);
-    }
+      }
 
-    button.addEventListener("click", async () => {
+      // Initiates the serial connection.
+      async function connectSerial() {
         try {
-            const port = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0xc0de }] });
+          const port = await navigator.serial.requestPort({
+            filters: [{ usbVendorId: 0xc0de }],
+          });
+          await port.open({ baudRate: 115200 });
 
-            await port.open({ baudRate: 115200 });
+          machine.port = port;
+          machine.writer = port.writable.getWriter();
+          machine.reader = port.readable.getReader();
+          console.log("Serial connection established.");
+          readSerialData();
+        } catch (error) {
+          console.error("Error connecting to serial port:", error);
+        }
+      }
 
-            writer = port.writable.getWriter();
-            reader = port.readable.getReader();
-
-            console.log("Connected");
-
-            let line = '';
-
-            while (true) {
-                const { value, done } = await reader.read();
-
-                if (done) {
-                    break;
-                }
-
-                line += new TextDecoder().decode(value);
-
-                if (line.endsWith("\n")) {
-                    if (line.startsWith('motion_state=')) {
-                        const state = line.split('=')[1].trim();
-
-                        onMotion(rsDbgToJson(state));
-                    } else {
-                        console.log(line);
-                    }
-
-                    line = '';
-                }
+      // Continuously reads serial data and processes complete lines.
+      async function readSerialData() {
+        let lineBuffer = "";
+        try {
+          while (true) {
+            const { value, done } = await machine.reader.read();
+            if (done) {
+              console.log("Reader closed");
+              break;
             }
-        } catch (e) {
-            console.error(e);
+            lineBuffer += new TextDecoder().decode(value);
+            if (lineBuffer.endsWith("\n")) {
+              processSerialLine(lineBuffer.trim());
+              lineBuffer = "";
+            }
+          }
+        } catch (error) {
+          console.error("Error reading from serial port:", error);
+        } finally {
+          if (machine.reader) {
+            try {
+              await machine.reader.releaseLock();
+            } catch (e) {
+              console.error("Error releasing reader lock:", e);
+            }
+          }
         }
-    });
+      }
 
-    go.addEventListener("click", async () => {
-        if (writer) {
-            await writer.write(new TextEncoder().encode("go 100 100 200 1000"));
+      // Processes a single line received from the serial port.
+      function processSerialLine(line) {
+        if (line.startsWith("motion_state=")) {
+          const stateStr = line.substring("motion_state=".length).trim();
+          try {
+            const state = parseRustDebugString(stateStr);
+            motionState = state;
+            if (state.current_pos) {
+              path.push(state.current_pos);
+            }
+            console.log("Motion state updated:", state);
+          } catch (error) {
+            console.error("Error parsing motion state:", error, line);
+          }
+        } else {
+          console.log("Serial output:", line);
         }
-    });
+      }
 
-    reset.addEventListener("click", async () => {
-        if (writer) {
-            await writer.write(new TextEncoder().encode("q"));
-        }
-    });
+      // Event listeners for button actions after DOM is loaded.
+      document.addEventListener("DOMContentLoaded", () => {
+        const connectBtn = document.getElementById("button");
+        const goBtn = document.getElementById("go");
+        const stopBtn = document.getElementById("stopBtn");
+        const resetBtn = document.getElementById("reset");
 
-</script>
+        connectBtn.addEventListener("click", connectSerial);
 
+        goBtn.addEventListener("click", () => {
+          if (machine.writer) {
+            const command = "go 5 100 100 5000\n";
+            machine.writer.write(new TextEncoder().encode(command));
+          }
+        });
+
+        stopBtn.addEventListener("click", () => {
+          if (machine.writer) {
+            machine.writer.write(new TextEncoder().encode("stop\n"));
+          }
+        });
+
+        resetBtn.addEventListener("click", () => {
+          if (machine.writer) {
+            machine.writer.write(new TextEncoder().encode("q\n"));
+            // Optionally clear the state after a reset.
+            path = [];
+            motionState = null;
+          }
+        });
+      });
+    </script>
+
+    <style>
+      body {
+        overflow: hidden;
+        margin: 0;
+        padding: 0;
+      }
+    </style>
+  </head>
+
+  <body>
+    <button id="button">Connect</button>
+    <button id="go">Go</button>
+    <button id="stopBtn">Stop</button>
+    <button id="reset">Reset</button>
+  </body>
 </html>
