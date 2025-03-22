@@ -13,11 +13,108 @@
       let motionState = null;
       let path = [];
 
-      const machine = {
-        writer: null,
-        reader: null,
-        port: null,
-      };
+      class Machine {
+        constructor() {
+          this.port = null;
+          this.writer = null;
+          this.reader = null;
+        }
+
+        async connect() {
+          try {
+            const port = await navigator.serial.requestPort({
+              filters: [{ usbVendorId: 0xc0de }],
+            });
+            await port.open({ baudRate: 115200 });
+
+            this.port = port;
+            this.writer = port.writable.getWriter();
+            this.reader = port.readable.getReader();
+            console.log("Serial connection established.");
+
+            this.readSerialData();
+          } catch (error) {
+            console.error("Error connecting to serial port:", error);
+          }
+        }
+
+        async readSerialData() {
+          let lineBuffer = "";
+          try {
+            while (true) {
+              const { value, done } = await this.reader.read();
+              if (done) {
+                console.log("Reader closed");
+                break;
+              }
+              lineBuffer += new TextDecoder().decode(value);
+
+              console.log("Line buffer:", lineBuffer);
+
+              if (lineBuffer.endsWith("\n")) {
+                this.processSerialLine(lineBuffer.trim());
+                lineBuffer = "";
+              }
+            }
+          } catch (error) {
+            console.error("Error reading from serial port:", error);
+          } finally {
+            if (this.reader) {
+              try {
+                await this.reader.releaseLock();
+              } catch (e) {
+                console.error("Error releasing reader lock:", e);
+              }
+            }
+          }
+        }
+
+        processSerialLine(line) {
+          if (line.startsWith("motion_state=")) {
+            const stateStr = line.substring("motion_state=".length).trim();
+            try {
+              const state = this.parseRustDebugString(stateStr);
+              motionState = state;
+              if (state.current_pos) {
+                path.push(state.current_pos);
+              }
+              console.log("Motion state updated:", state);
+            } catch (error) {
+              console.error("Error parsing motion state:", error, line);
+            }
+          } else {
+            console.log("Serial output:", line);
+          }
+        }
+
+        parseRustDebugString(rustStr) {
+          const innerStr = rustStr
+            .replace(/^[^{]*{/, "{")
+            .replace(/}[^}]*$/, "}");
+          const jsonStr = innerStr.replace(/(\w+):/g, '"$1":');
+          return JSON.parse(jsonStr);
+        }
+
+        async close() {
+          if (this.writer) {
+            this.writer.close();
+          }
+          if (this.reader) {
+            this.reader.cancel();
+          }
+          if (this.port) {
+            await this.port.close();
+          }
+        }
+
+        async send(command) {
+          if (this.writer) {
+            this.writer.write(new TextEncoder().encode(command + "\n"));
+          }
+        }
+      }
+
+      let machine = new Machine();
 
       // p5.js functions
       function setup() {
@@ -49,12 +146,9 @@
           return;
         }
 
-        if (machine?.writer) {
-          machine.writer.write(new TextEncoder().encode("stop\n"));
-
-          const command = `go ${targetX} ${targetY} 0 1000\n`;
-          machine.writer.write(new TextEncoder().encode(command));
-        }
+        const command = `go ${targetX} ${targetY} 0 1000`;
+        machine.send("stop");
+        machine.send(command);
       }
 
       function draw() {
@@ -100,110 +194,21 @@
         }
       }
 
-      // Converts the Rust debug string to a JSON object.
-      function parseRustDebugString(rustStr) {
-        const innerStr = rustStr
-          .replace(/^[^{]*{/, "{")
-          .replace(/}[^}]*$/, "}");
-        const jsonStr = innerStr.replace(/(\w+):/g, '"$1":');
-        return JSON.parse(jsonStr);
-      }
-
-      // Initiates the serial connection.
-      async function connectSerial() {
-        try {
-          const port = await navigator.serial.requestPort({
-            filters: [{ usbVendorId: 0xc0de }],
-          });
-          await port.open({ baudRate: 115200 });
-
-          machine.port = port;
-          machine.writer = port.writable.getWriter();
-          machine.reader = port.readable.getReader();
-          console.log("Serial connection established.");
-          readSerialData();
-        } catch (error) {
-          console.error("Error connecting to serial port:", error);
-        }
-      }
-
-      // Continuously reads serial data and processes complete lines.
-      async function readSerialData() {
-        let lineBuffer = "";
-        try {
-          while (true) {
-            const { value, done } = await machine.reader.read();
-            if (done) {
-              console.log("Reader closed");
-              break;
-            }
-            lineBuffer += new TextDecoder().decode(value);
-            if (lineBuffer.endsWith("\n")) {
-              processSerialLine(lineBuffer.trim());
-              lineBuffer = "";
-            }
-          }
-        } catch (error) {
-          console.error("Error reading from serial port:", error);
-        } finally {
-          if (machine.reader) {
-            try {
-              await machine.reader.releaseLock();
-            } catch (e) {
-              console.error("Error releasing reader lock:", e);
-            }
-          }
-        }
-      }
-
-      // Processes a single line received from the serial port.
-      function processSerialLine(line) {
-        if (line.startsWith("motion_state=")) {
-          const stateStr = line.substring("motion_state=".length).trim();
-          try {
-            const state = parseRustDebugString(stateStr);
-            motionState = state;
-            if (state.current_pos) {
-              path.push(state.current_pos);
-            }
-            console.log("Motion state updated:", state);
-          } catch (error) {
-            console.error("Error parsing motion state:", error, line);
-          }
-        } else {
-          console.log("Serial output:", line);
-        }
-      }
-
-      // Event listeners for button actions after DOM is loaded.
       document.addEventListener("DOMContentLoaded", () => {
         const connectBtn = document.getElementById("button");
-        const goBtn = document.getElementById("go");
         const stopBtn = document.getElementById("stopBtn");
         const resetBtn = document.getElementById("reset");
 
-        connectBtn.addEventListener("click", connectSerial);
-
-        goBtn.addEventListener("click", () => {
-          if (machine.writer) {
-            const command = "go 5 100 100 5000\n";
-            machine.writer.write(new TextEncoder().encode(command));
-          }
-        });
+        connectBtn.addEventListener("click", () => machine.connect());
 
         stopBtn.addEventListener("click", () => {
-          if (machine.writer) {
-            machine.writer.write(new TextEncoder().encode("stop\n"));
-          }
+          machine.send("stop");
         });
 
         resetBtn.addEventListener("click", () => {
-          if (machine.writer) {
-            machine.writer.write(new TextEncoder().encode("q\n"));
-            // Optionally clear the state after a reset.
-            path = [];
-            motionState = null;
-          }
+          machine.send("q");
+          path = [];
+          motionState = null;
         });
       });
     </script>
