@@ -10,7 +10,7 @@ use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
 };
 use fixed::traits::ToFixed as _;
-use libm::{fabsf, floorf, hypotf};
+use libm::{hypotf, powf, sqrtf};
 
 use crate::{Irqs, StepperResources};
 
@@ -21,165 +21,242 @@ pub static STOP_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static MOTION_SIGNAL: Signal<CriticalSectionRawMutex, MotionState> = Signal::new();
 pub static MOTION_QUEUE: Channel<CriticalSectionRawMutex, MotionCommand, 128> = Channel::new();
 
+const DT: f32 = 0.001; // 1ms
+const EPS: f32 = 1e-6;
+const PIO_CLOCK_HZ: u32 = 125_000_000;
+
+#[derive(Debug, Clone)]
+pub struct MotionState {
+    current_pos: [f32; 3], // Current position of each axis
+    current_velocity: f32,
+
+    target_pos: [f32; 3],
+    target_velocity: f32,
+
+    distance_remaining: f32,
+    current_acceleration: f32,
+    deceleration_phase: bool,
+
+    traveled_distance: f32,
+}
+
+impl MotionState {
+    pub const fn new() -> Self {
+        Self {
+            current_pos: [0.0; 3],
+            current_velocity: 0.0,
+
+            target_pos: [0.0; 3],
+            target_velocity: 0.0,
+
+            distance_remaining: 0.0,
+            current_acceleration: 0.0,
+            deceleration_phase: false,
+
+            traveled_distance: 0.0,
+        }
+    }
+}
+
 #[embassy_executor::task]
 pub async fn motion_task(r: StepperResources) {
     let mut io = MotionIO::from(r);
 
     loop {
-        let command = MOTION_QUEUE.receive().await;
+        let cmd = MOTION_QUEUE.receive().await;
+        log::info!("Received command: {:?}", cmd);
 
-        match select::select(execute_motion(&mut io, command), STOP_SIGNAL.wait()).await {
-            select::Either::First(_) => {
-                log::info!("Motion done");
+        match cmd {
+            MotionCommand::Zero => {
+                let zeroed = MotionState::new();
+                CURRENT_STATE.lock().await.replace(zeroed.clone());
+                MOTION_SIGNAL.signal(zeroed);
+                log::info!("Homed to zero");
             }
-            select::Either::Second(_) => {
-                log::info!("Motion stopped");
+            MotionCommand::Linear(target, feed) => {
+                {
+                    let st = CURRENT_STATE.lock().await;
+                    let mut s = st.borrow_mut();
+                    s.target_pos = target;
+                    s.target_velocity = feed;
+                }
+
+                match select::select(
+                    execute_linear_motion(&mut io, target, feed),
+                    STOP_SIGNAL.wait(),
+                )
+                .await
+                {
+                    select::Either::First(_) => {
+                        // Motion completed
+                        let state = CURRENT_STATE.lock().await;
+                        let mut s = state.borrow_mut();
+                        s.current_pos = target;
+                        s.current_velocity = 0.0;
+                        s.distance_remaining = 0.0;
+                        s.traveled_distance = 0.0;
+
+                        log::info!(
+                            "Moved to target: ({}, {}, {}), feed: {}",
+                            target[0],
+                            target[1],
+                            target[2],
+                            feed
+                        );
+                    }
+                    select::Either::Second(_) => {
+                        // Motion stopped
+                        let state = CURRENT_STATE.lock().await;
+                        let mut s = state.borrow_mut();
+                        s.current_velocity = 0.0;
+                        s.distance_remaining = 0.0;
+                        s.traveled_distance = 0.0;
+                    }
+                }
             }
         }
     }
 }
 
-async fn execute_motion(io: &mut MotionIO<'_>, command: MotionCommand) {
-    let mut state = { CURRENT_STATE.lock().await.borrow().clone() };
-
-    let accel = 100_000.0f32;
-
-    let micro_steps = 16;
-
-    let steps_per_mm = [267.0f32, 267.0f32, 267.0f32];
-    let steps_per_mm = [
-        steps_per_mm[0] * micro_steps as f32,
-        steps_per_mm[1] * micro_steps as f32,
-        steps_per_mm[2] * micro_steps as f32,
-    ];
-
-    let [mut x0, mut y0, mut z0] = state.current_pos;
-
-    let (x1, y1, z1, feed_rate) = match command {
-        MotionCommand::Linear([x, y, z], feed_rate) => (x, y, z, feed_rate),
-    };
+async fn execute_linear_motion(io: &mut MotionIO<'_>, target: [f32; 3], feed_rate: f32) {
+    let state = CURRENT_STATE.lock().await.borrow().clone();
+    let [x0, y0, z0] = state.current_pos;
+    let [x1, y1, z1] = target;
 
     let dx = x1 - x0;
     let dy = y1 - y0;
     let dz = z1 - z0;
+    let total_distance = dist3d(x0, y0, z0, x1, y1, z1);
+    if total_distance < EPS {
+        return;
+    }
 
-    let distance = dist3d(x0, y0, z0, x1, y1, z1);
+    let steps_per_mm = [267.0, 267.0, 267.0];
+    let dx_steps = (dx.abs() * steps_per_mm[0]) as u32;
+    let dy_steps = (dy.abs() * steps_per_mm[1]) as u32;
+    let dz_steps = (dz.abs() * steps_per_mm[2]) as u32;
 
+    let major_steps = dx_steps.max(dy_steps).max(dz_steps).max(1);
+
+    io.dirx
+        .set_level(if dx >= 0.0 { Level::High } else { Level::Low });
+    io.diry
+        .set_level(if dy >= 0.0 { Level::High } else { Level::Low });
+    io.dirz
+        .set_level(if dz >= 0.0 { Level::High } else { Level::Low });
+
+    // S-curve state
+    let mut current_velocity = 0.0;
+    let mut current_acceleration = 0.0;
+    let mut deceleration_phase = false;
     let mut traveled = 0.0;
-    let mut current_vel = 0.0; // or carry over from prior block
-    let max_vel = feed_rate; // in, say, mm/s
-    let dt = 0.0001; // 100us
-    let mut is_decelerating = false;
 
-    let epsilon = 0.001; // mm
+    let max_accel = 200_000.0; // mm/s²
+    let max_jerk = max_accel / 0.05; // mm/s³
 
-    let mut delay_accum_x = 0.0f32;
-    let mut delay_accum_y = 0.0f32;
-    let mut delay_accum_z = 0.0f32;
-
-    while traveled < distance - epsilon {
-        let dist_left = distance - traveled;
-
-        if is_decelerating {
-            current_vel -= accel * dt;
-            if current_vel < 0.0 {
-                break;
-            }
-        } else {
-            let decel_dist = (current_vel * current_vel) / (2.0 * accel);
-            if decel_dist >= dist_left {
-                is_decelerating = true;
-            } else if current_vel < max_vel {
-                current_vel += accel * dt;
-                if current_vel > max_vel {
-                    current_vel = max_vel;
-                }
-            }
+    for _ in 0..major_steps {
+        // Update velocity via jerk‑limited S‑curve
+        let remaining = total_distance - traveled;
+        if remaining < EPS {
+            MOTION_SIGNAL.signal(CURRENT_STATE.lock().await.borrow().clone());
+            break;
         }
 
-        let delta_dist = current_vel * dt;
+        // then each slice:
+        s_curve_velocity(
+            remaining,
+            feed_rate,
+            &mut current_velocity,
+            &mut current_acceleration,
+            &mut deceleration_phase,
+            max_accel,
+            max_jerk,
+        );
+
+        let delta_dist = current_velocity * DT; // mm
+        let frac = delta_dist / total_distance;
+
+        let raw_x = dx * frac * steps_per_mm[0];
+        let raw_y = dy * frac * steps_per_mm[1];
+        let raw_z = dz * frac * steps_per_mm[2];
+
+        let sx = raw_x.abs() as u32;
+        let sy = raw_y.abs() as u32;
+        let sz = raw_z.abs() as u32;
+
+        // 5) for any axis that needs steps, push “N steps @ delay”:
+        if sx > 0 {
+            // delay between each of those sx pulses so they fill DT
+            let delay_x = (DT * (PIO_CLOCK_HZ as f32) / sx as f32) as u32;
+            io.smx.tx().wait_push(sx).await;
+            io.smx.tx().wait_push(delay_x).await;
+        }
+        if sy > 0 {
+            let delay_y = (DT * (PIO_CLOCK_HZ as f32) / sy as f32) as u32;
+            io.smy.tx().wait_push(sy).await;
+            io.smy.tx().wait_push(delay_y).await;
+        }
+        if sz > 0 {
+            let delay_z = (DT * (PIO_CLOCK_HZ as f32) / sz as f32) as u32;
+            io.smz.tx().wait_push(sz).await;
+            io.smz.tx().wait_push(delay_z).await;
+        }
+
         traveled += delta_dist;
 
-        let frac = delta_dist / distance;
-
-        let step_x_mm = dx * frac;
-        let step_y_mm = dy * frac;
-        let step_z_mm = dz * frac;
-
-        let steps_x = step_x_mm * steps_per_mm[0];
-        let steps_y = step_y_mm * steps_per_mm[1];
-        let steps_z = step_z_mm * steps_per_mm[2];
-
-        x0 += step_x_mm;
-        y0 += step_y_mm;
-        z0 += step_z_mm;
-
-        state.current_speed = current_vel;
-        state.current_pos = [x0, y0, z0];
-
-        io.dirx.set_level(if steps_x >= 0.0f32 {
-            Level::High
-        } else {
-            Level::Low
-        });
-
-        io.diry.set_level(if steps_y >= 0.0f32 {
-            Level::High
-        } else {
-            Level::Low
-        });
-
-        io.dirz.set_level(if steps_z >= 0.0f32 {
-            Level::High
-        } else {
-            Level::Low
-        });
-
-        let steps_x_abs = fabsf(steps_x);
-        let steps_y_abs = fabsf(steps_y);
-        let steps_z_abs = fabsf(steps_z);
-
-        let rate_x = (steps_x_abs as f32) / dt; // steps/s
-        let rate_y = (steps_y_abs as f32) / dt; // steps/s
-        let rate_z = (steps_z_abs as f32) / dt; // steps/s
-
-        let step_period_x = (1200 * 200_000) as f32 / rate_x;
-        let step_period_y = (1200 * 200_000) as f32 / rate_y;
-        let step_period_z = (1200 * 200_000) as f32 / rate_z;
-
-        delay_accum_x += step_period_x;
-        let delay_cycles_x = floorf(delay_accum_x) as u32;
-        delay_accum_x -= delay_cycles_x as f32;
-
-        delay_accum_y += step_period_y;
-        let delay_cycles_y = floorf(delay_accum_y) as u32;
-        delay_accum_y -= delay_cycles_y as f32;
-
-        delay_accum_z += step_period_z;
-        let delay_cycles_z = floorf(delay_accum_z) as u32;
-        delay_accum_z -= delay_cycles_z as f32;
-
-        if steps_x_abs > 0.0 {
-            io.smx.tx().wait_push(steps_x_abs as u32).await;
-            io.smx.tx().wait_push(delay_cycles_x).await;
-        }
-
-        if steps_y_abs > 0.0 {
-            io.smy.tx().wait_push(steps_y_abs as u32).await;
-            io.smy.tx().wait_push(delay_cycles_y).await;
-        }
-
-        if steps_z_abs > 0.0 {
-            io.smz.tx().wait_push(steps_z_abs as u32).await;
-            io.smz.tx().wait_push(delay_cycles_z).await;
-        }
-
+        // Update shared state
         {
-            CURRENT_STATE.lock().await.replace(state.clone());
-        }
+            let st = CURRENT_STATE.lock().await;
+            let mut s = st.borrow_mut();
+            s.traveled_distance = traveled;
+            s.current_velocity = current_velocity;
+            s.distance_remaining = remaining - delta_dist;
 
-        MOTION_SIGNAL.signal(state.clone());
+            s.current_pos[0] += (raw_x / steps_per_mm[0]) as f32;
+            s.current_pos[1] += (raw_y / steps_per_mm[1]) as f32;
+            s.current_pos[2] += (raw_z / steps_per_mm[2]) as f32;
+
+            s.current_acceleration = current_acceleration;
+            s.deceleration_phase = deceleration_phase;
+        }
+        MOTION_SIGNAL.signal(CURRENT_STATE.lock().await.borrow().clone());
     }
+}
+
+fn s_curve_velocity(
+    dist_rem: f32,
+    v_target: f32,
+    v_curr: &mut f32,
+    a_curr: &mut f32,
+    decel: &mut bool,
+    a_max: f32,
+    j_max: f32,
+) {
+    let accel_dist = (*v_curr * *v_curr) / (2.0 * a_max);
+    let jerk_dist = (4.0 / 3.0) * powf(*v_curr, 1.5) / sqrtf(j_max);
+    if accel_dist + jerk_dist >= dist_rem && !*decel {
+        *decel = true;
+        *a_curr = 0.0;
+    }
+
+    // 2) desired accel
+    let desired = if *decel {
+        if dist_rem > EPS {
+            -(*v_curr * *v_curr) / (2.0 * dist_rem)
+        } else {
+            -a_max
+        }
+    } else {
+        a_max
+    }
+    .clamp(-a_max, a_max);
+
+    // 3) clamp accel change by jerk
+    let delta_a = (desired - *a_curr).clamp(-j_max * DT, j_max * DT);
+    *a_curr += delta_a;
+
+    // 4) update velocity
+    *v_curr = (*v_curr + *a_curr * DT).clamp(0.0, v_target);
 }
 
 struct MotionIO<'a> {
@@ -202,7 +279,7 @@ impl<'a> MotionIO<'a> {
             ..
         } = Pio::new(resources.pio, Irqs);
 
-        let stepper_prog = pio_proc::pio_asm!(
+        let stepper_prog = pio::pio_asm!(
             "set pindirs 1"
 
             ".wrap_target"
@@ -226,6 +303,8 @@ impl<'a> MotionIO<'a> {
             ".wrap"
         );
 
+        let clock_div = (104.17).to_fixed(); // 125MHz / 104.17 = 1.2MHz = we are aiming for 200khz max pulse rate (5us per pulse), each pulse is 6 cycles
+
         let stepper_prog = common.load_program(&stepper_prog.program);
 
         let x_step = common.make_pio_pin(resources.x_step);
@@ -234,19 +313,19 @@ impl<'a> MotionIO<'a> {
 
         let mut cfgx = embassy_rp::pio::Config::default();
         cfgx.use_program(&stepper_prog, &[]);
-        cfgx.clock_divider = (104.17).to_fixed(); // 125MHz / 104.17 = 1.2MHz = we are aiming for 200khz max pulse rate (5us per pulse), each pulse is 6 cycles
+        cfgx.clock_divider = clock_div;
         cfgx.set_set_pins(&[&x_step]);
         smx.set_config(&cfgx);
 
         let mut cfgy = embassy_rp::pio::Config::default();
         cfgy.use_program(&stepper_prog, &[]);
-        cfgy.clock_divider = (104.17).to_fixed(); // 125MHz / 104.17 = 1.2MHz = we are aiming for 200khz max pulse rate (5us per pulse), each pulse is 6 cycles
+        cfgy.clock_divider = clock_div;
         cfgy.set_set_pins(&[&y_step]);
         smy.set_config(&cfgy);
 
         let mut cfgz = embassy_rp::pio::Config::default();
         cfgz.use_program(&stepper_prog, &[]);
-        cfgz.clock_divider = (104.17).to_fixed(); // 125MHz / 104.17 = 1.2MHz = we are aiming for 200khz max pulse rate (5us per pulse), each pulse is 6 cycles
+        cfgz.clock_divider = clock_div;
         cfgz.set_set_pins(&[&z_step]);
         smz.set_config(&cfgz);
 
@@ -266,24 +345,10 @@ impl<'a> MotionIO<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct MotionState {
-    current_pos: [f32; 3], // Current position of each axis
-    current_speed: f32,
-}
-
-impl MotionState {
-    pub const fn new() -> Self {
-        Self {
-            current_pos: [0.0; 3],
-            current_speed: 0.0,
-        }
-    }
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MotionCommand {
     Linear([f32; 3], f32),
+    Zero,
 }
 
 fn dist3d(x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32) -> f32 {

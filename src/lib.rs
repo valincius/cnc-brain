@@ -17,6 +17,7 @@ pub static CONTROLLER_CHANNEL: Channel<CriticalSectionRawMutex, ControllerComman
 pub enum ControllerCommand {
     MoveTo([f32; 3], f32),
     Stop,
+    Zero,
 }
 
 bind_interrupts!(pub struct Irqs {
@@ -32,11 +33,11 @@ assign_resources! {
 
     for_motion: StepperResources {
         pio: PIO0,
-        x_step: PIN_0,
-        x_dir: PIN_1,
-        y_step: PIN_2,
-        y_dir: PIN_3,
-        z_step: PIN_4,
-        z_dir: PIN_5,
+        x_step: PIN_16,
+        x_dir: PIN_17,
+        y_step: PIN_20,
+        y_dir: PIN_21,
+        z_step: PIN_18,
+        z_dir: PIN_19,
     }
 }

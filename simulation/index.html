@@ -1,24 +1,231 @@
 <!DOCTYPE html>
 <html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Serial Communication with p5.js</title>
 
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
     <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.min.js"></script>
-    <script src="sketch.js"></script>
+    <script>
+      // Global variables for p5 canvas and motion state
+      let canvasWidth = window.innerWidth;
+      let canvasHeight = window.innerHeight;
+      let motionState = null;
+      let path = [];
+
+      class Machine {
+        constructor() {
+          this.port = null;
+          this.writer = null;
+          this.reader = null;
+        }
+
+        async connect() {
+          try {
+            const port = await navigator.serial.requestPort({
+              filters: [{ usbVendorId: 0xc0de }],
+            });
+            await port.open({ baudRate: 115200 });
+
+            this.port = port;
+            this.writer = port.writable.getWriter();
+            this.reader = port.readable.getReader();
+            console.log("Serial connection established.");
+
+            this.readSerialData();
+          } catch (error) {
+            console.error("Error connecting to serial port:", error);
+          }
+        }
+
+        async readSerialData() {
+          let lineBuffer = "";
+          try {
+            while (true) {
+              const { value, done } = await this.reader.read();
+              if (done) {
+                console.log("Reader closed");
+                break;
+              }
+              lineBuffer += new TextDecoder().decode(value);
+
+              console.log("Line buffer:", lineBuffer);
+
+              if (lineBuffer.endsWith("\n")) {
+                this.processSerialLine(lineBuffer.trim());
+                lineBuffer = "";
+              }
+            }
+          } catch (error) {
+            console.error("Error reading from serial port:", error);
+          } finally {
+            if (this.reader) {
+              try {
+                await this.reader.releaseLock();
+              } catch (e) {
+                console.error("Error releasing reader lock:", e);
+              }
+            }
+          }
+        }
+
+        processSerialLine(line) {
+          if (line.startsWith("motion_state=")) {
+            const stateStr = line.substring("motion_state=".length).trim();
+            try {
+              const state = this.parseRustDebugString(stateStr);
+              motionState = state;
+              if (state.current_pos) {
+                path.push(state.current_pos);
+              }
+              console.log("Motion state updated:", state);
+            } catch (error) {
+              console.error("Error parsing motion state:", error, line);
+            }
+          } else {
+            console.log("Serial output:", line);
+          }
+        }
+
+        parseRustDebugString(rustStr) {
+          const innerStr = rustStr
+            .replace(/^[^{]*{/, "{")
+            .replace(/}[^}]*$/, "}");
+          const jsonStr = innerStr.replace(/(\w+):/g, '"$1":');
+          return JSON.parse(jsonStr);
+        }
+
+        async close() {
+          if (this.writer) {
+            this.writer.close();
+          }
+          if (this.reader) {
+            this.reader.cancel();
+          }
+          if (this.port) {
+            await this.port.close();
+          }
+        }
+
+        async send(command) {
+          if (this.writer) {
+            this.writer.write(new TextEncoder().encode(command + "\n"));
+          }
+        }
+      }
+
+      let machine = new Machine();
+
+      // p5.js functions
+      function setup() {
+        createCanvas(canvasWidth, canvasHeight);
+        syncWindow();
+      }
+
+      function windowResized() {
+        syncWindow();
+      }
+
+      function syncWindow() {
+        canvasWidth = window.innerWidth;
+        canvasHeight = window.innerHeight;
+        resizeCanvas(canvasWidth, canvasHeight);
+      }
+
+      function mousePressed() {
+        const targetX = (mouseX - canvasWidth / 2) / 1.8 / 2;
+        const targetY = (mouseY - canvasHeight / 2) / 1.8 / 2;
+
+        // Only send command if within bounds
+        if (
+          targetX < -100 ||
+          targetX > 100 ||
+          targetY < -100 ||
+          targetY > 100
+        ) {
+          return;
+        }
+
+        const command = `go ${targetX} ${targetY} 0 1000`;
+        machine.send("stop");
+        machine.send(command);
+      }
+
+      function draw() {
+        background(0);
+        const boxSize = 200;
+        const scaleFactor = (0.8 * canvasHeight) / boxSize;
+
+        // Center the coordinate system and scale the drawing
+        translate(canvasWidth / 2, canvasHeight / 2);
+        scale(scaleFactor);
+        rectMode(CENTER);
+        strokeWeight(5 / scaleFactor);
+
+        // Draw the boundary box
+        push();
+        stroke(255);
+        noFill();
+        rect(0, 0, boxSize, boxSize);
+        pop();
+
+        // Draw the target point in blue if available
+        if (motionState?.target_pos) {
+          stroke(0, 0, 255);
+          point(motionState.target_pos[0], motionState.target_pos[1]);
+        }
+
+        // Draw path lines in white
+        for (let i = 1; i < path.length; i++) {
+          stroke(255);
+          line(path[i - 1][0], path[i - 1][1], path[i][0], path[i][1]);
+        }
+
+        // Draw the last point in red
+        if (path.length > 0) {
+          stroke(255, 0, 0);
+          point(path[path.length - 1][0], path[path.length - 1][1]);
+        }
+
+        // Draw the first point in green if exists
+        if (path.length > 1) {
+          stroke(0, 255, 0);
+          point(path[0][0], path[0][1]);
+        }
+      }
+
+      document.addEventListener("DOMContentLoaded", () => {
+        const connectBtn = document.getElementById("button");
+        const stopBtn = document.getElementById("stopBtn");
+        const resetBtn = document.getElementById("reset");
+
+        connectBtn.addEventListener("click", () => machine.connect());
+
+        stopBtn.addEventListener("click", () => {
+          machine.send("stop");
+        });
+
+        resetBtn.addEventListener("click", () => {
+          machine.send("q");
+          path = [];
+          motionState = null;
+        });
+      });
+    </script>
 
     <style>
-        body {
-            overflow: hidden;
-            margin: 0;
-            padding: 0;
-        }
+      body {
+        overflow: hidden;
+        margin: 0;
+        padding: 0;
+      }
     </style>
-</head>
+  </head>
 
-<body>
-
-</body>
-
+  <body>
+    <button id="button">Connect</button>
+    <button id="go">Go</button>
+    <button id="stopBtn">Stop</button>
+    <button id="reset">Reset</button>
+  </body>
 </html>
