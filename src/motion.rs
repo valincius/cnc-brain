@@ -75,6 +75,26 @@ pub async fn motion_task(r: StepperResources) {
 async fn execute_motion(io: &mut MotionIO<'_>, command: MotionCommand) {
     // Acquire current motion state.
     let mut state = { CURRENT_STATE.lock().await.borrow().clone() };
+    let [mut x0, mut y0, mut z0] = state.current_pos;
+
+    if command == MotionCommand::Zero {
+        // Reset position to zero.
+        state.current_pos = [0.0, 0.0, 0.0];
+        state.current_velocity = 0.0;
+        state.target_pos = [0.0, 0.0, 0.0];
+        state.target_velocity = 0.0;
+        state.distance_remaining = 0.0;
+        state.current_acceleration = 0.0;
+        state.deceleration_phase = false;
+        state.effective_jerk = 0.0;
+        state.traveled_distance = 0.0;
+
+        {
+            CURRENT_STATE.lock().await.replace(state.clone());
+        }
+        MOTION_SIGNAL.signal(state.clone());
+        return;
+    }
 
     // === Motion Profile Parameters (units: mm and s) ===
     const MAX_ACCEL: f32 = 20_000.0 * 60.0 * 25.4; // Maximum acceleration (i/m²)
@@ -87,7 +107,7 @@ async fn execute_motion(io: &mut MotionIO<'_>, command: MotionCommand) {
     const BOOST_FACTOR: f32 = 10.0; // Boost factor for jerk
 
     // Micro-stepping and conversion factors.
-    let micro_steps = 16;
+    let micro_steps = 1;
     let base_steps = [267.0, 267.0, 267.0];
     let steps_per_mm = [
         base_steps[0] * micro_steps as f32,
@@ -96,9 +116,9 @@ async fn execute_motion(io: &mut MotionIO<'_>, command: MotionCommand) {
     ];
 
     // === Initial and Target Positions ===
-    let [mut x0, mut y0, mut z0] = state.current_pos;
     let (x1, y1, z1, feed_rate) = match command {
-        MotionCommand::Linear([x, y, z], feed_rate) => (x, y, z, feed_rate),
+        MotionCommand::Linear(target, feed_rate) => (target[0], target[1], target[2], feed_rate),
+        _ => panic!("Invalid command"),
     };
 
     state.target_pos = [x1, y1, z1];
@@ -379,9 +399,10 @@ impl<'a> MotionIO<'a> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum MotionCommand {
     Linear([f32; 3], f32),
+    Zero,
 }
 
 fn dist3d(x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32) -> f32 {

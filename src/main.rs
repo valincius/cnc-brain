@@ -66,6 +66,10 @@ async fn main_task() {
             ControllerCommand::Stop => {
                 STOP_SIGNAL.signal(());
             }
+
+            ControllerCommand::Zero => {
+                MOTION_QUEUE.send(MotionCommand::Zero).await;
+            }
         }
     }
 }
@@ -78,8 +82,9 @@ async fn controller_task(r: ControllerResources) {
     spawner.spawn(usb_comm_task(usb_driver)).unwrap();
 
     loop {
-        let state = MOTION_SIGNAL.wait().await;
-        log::info!("motion_state={:?}", state);
+        if let Some(state) = MOTION_SIGNAL.try_take() {
+            log::info!("motion_state={:?}", state);
+        }
 
         Timer::after_millis(50).await;
     }
