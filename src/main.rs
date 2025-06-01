@@ -2,11 +2,11 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
-use cnc_brain::motion::{MOTION_QUEUE, MOTION_SIGNAL, MotionCommand, STOP_SIGNAL, motion_task};
+use cnc_brain::motion::{self, MOTION_QUEUE, MOTION_SIGNAL, MotionCommand, STOP_SIGNAL};
 use cnc_brain::receiver::usb_comm_task;
 use cnc_brain::{
-    AssignedResources, CONTROLLER_CHANNEL, ControllerCommand, ControllerResources, Irqs,
-    StepperResources, split_resources,
+    AssignedResources, CONTROLLER_CHANNEL, ControllerCommand, ControllerResources, InputResources,
+    Irqs, StepperResources, jog_wheel, split_resources,
 };
 
 use cortex_m_rt::entry;
@@ -47,10 +47,13 @@ fn main() -> ! {
 
     interrupt::SWI_IRQ_0.set_priority(Priority::P3);
     let spawner = EXECUTOR_HI.start(interrupt::SWI_IRQ_0);
-    spawner.must_spawn(motion_task(r.for_motion));
+    spawner.must_spawn(motion::motion_task(r.for_motion));
 
     let executor0 = EXECUTOR0.init(Executor::new());
-    executor0.run(|spawner| spawner.must_spawn(main_task()));
+    executor0.run(|spawner| {
+        spawner.must_spawn(jog_wheel::task(r.for_inputs));
+        spawner.must_spawn(main_task());
+    });
 }
 
 #[embassy_executor::task]

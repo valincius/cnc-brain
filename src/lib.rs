@@ -1,6 +1,7 @@
 #![no_std]
 #![feature(impl_trait_in_assoc_type)]
 
+pub mod jog_wheel;
 pub mod motion;
 pub mod receiver;
 
@@ -39,5 +40,13 @@ assign_resources! {
         y_dir: PIN_21,
         z_step: PIN_18,
         z_dir: PIN_19,
+    }
+
+    for_inputs: InputResources {
+        jog_a: PIN_0,
+        jog_b: PIN_1,
+        jog_pwr: PIN_3,
+        jog_a2: PIN_4,
+        jog_b2: PIN_5,
     }
 }
