@@ -45,8 +45,8 @@ assign_resources! {
     for_inputs: InputResources {
         jog_a: PIN_0,
         jog_b: PIN_1,
-        jog_pwr: PIN_3,
-        jog_a2: PIN_4,
-        jog_b2: PIN_5,
+        jog_pwr: PIN_2,
+        jog_a2: PIN_3,
+        jog_b2: PIN_4,
     }
 }

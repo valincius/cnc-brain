@@ -73,52 +73,123 @@ pub async fn motion_task(r: StepperResources) {
                 MOTION_SIGNAL.signal(zeroed);
                 log::info!("Homed to zero");
             }
-            MotionCommand::Linear(target, feed) => {
-                {
-                    let st = CURRENT_STATE.lock().await;
-                    let mut s = st.borrow_mut();
-                    s.target_pos = target;
-                    s.target_velocity = feed;
-                }
 
-                match select::select(
-                    execute_linear_motion(&mut io, target, feed),
-                    STOP_SIGNAL.wait(),
-                )
-                .await
-                {
-                    select::Either::First(_) => {
-                        // Motion completed
-                        let state = CURRENT_STATE.lock().await;
-                        let mut s = state.borrow_mut();
-                        s.current_pos = target;
-                        s.current_velocity = 0.0;
-                        s.distance_remaining = 0.0;
-                        s.traveled_distance = 0.0;
+            MotionCommand::MoveAbsolute(target, feed) => {
+                move_absolute(&mut io, target, feed).await;
+            }
 
-                        log::info!(
-                            "Moved to target: ({}, {}, {}), feed: {}",
-                            target[0],
-                            target[1],
-                            target[2],
-                            feed
-                        );
-                    }
-                    select::Either::Second(_) => {
-                        // Motion stopped
-                        let state = CURRENT_STATE.lock().await;
-                        let mut s = state.borrow_mut();
-                        s.current_velocity = 0.0;
-                        s.distance_remaining = 0.0;
-                        s.traveled_distance = 0.0;
-                    }
-                }
+            MotionCommand::MoveRelative(offset, feed) => {
+                move_relative(&mut io, offset, feed).await;
+            }
+
+            MotionCommand::Jog(offset, feed) => {
+                jog(&mut io, offset, feed).await;
+            }
+
+            MotionCommand::Stop => {
+                STOP_SIGNAL.signal(());
             }
         }
     }
 }
 
-async fn execute_linear_motion(io: &mut MotionIO<'_>, target: [f32; 3], feed_rate: f32) {
+async fn jog(io: &mut MotionIO<'_>, offset: [f32; 3], feed_rate: f32) {
+    let state = CURRENT_STATE.lock().await.borrow().clone();
+    let feed_rate = feed_rate.max(state.target_velocity);
+
+    log::info!(
+        "Jogging by offset: ({}, {}, {}), feed_rate: {}",
+        offset[0],
+        offset[1],
+        offset[2],
+        feed_rate
+    );
+
+    let [x0, y0, z0] = state.target_pos;
+    let target = [x0 + offset[0], y0 + offset[1], z0 + offset[2]];
+
+    move_absolute(io, target, feed_rate).await;
+}
+
+async fn move_relative(io: &mut MotionIO<'_>, offset: [f32; 3], feed_rate: f32) {
+    if feed_rate <= 0.0 {
+        log::warn!("Invalid feed rate: {}", feed_rate);
+        return;
+    }
+
+    log::info!(
+        "Moving relative by offset: ({}, {}, {}), feed_rate: {}",
+        offset[0],
+        offset[1],
+        offset[2],
+        feed_rate
+    );
+
+    let state = CURRENT_STATE.lock().await.borrow().clone();
+    let [x0, y0, z0] = state.current_pos;
+    let target = [x0 + offset[0], y0 + offset[1], z0 + offset[2]];
+
+    move_absolute(io, target, feed_rate).await;
+}
+
+async fn move_absolute(io: &mut MotionIO<'_>, target: [f32; 3], feed_rate: f32) {
+    if feed_rate <= 0.0 {
+        log::warn!("Invalid feed rate: {}", feed_rate);
+        return;
+    }
+
+    log::info!(
+        "Moving absolute to target: ({}, {}, {}), feed_rate: {}",
+        target[0],
+        target[1],
+        target[2],
+        feed_rate
+    );
+
+    match select::select(_move_absolute(io, target, feed_rate), STOP_SIGNAL.wait()).await {
+        select::Either::First(_) => {
+            // Motion completed
+            let state = CURRENT_STATE.lock().await;
+            let mut s = state.borrow_mut();
+            s.current_pos = target;
+            s.current_velocity = 0.0;
+            s.distance_remaining = 0.0;
+            s.traveled_distance = 0.0;
+
+            log::info!(
+                "Arrived at target: ({}, {}, {}), feed_rate: {}",
+                target[0],
+                target[1],
+                target[2],
+                feed_rate
+            );
+        }
+
+        select::Either::Second(_) => {
+            // Motion was stopped
+            log::info!(
+                "Motion stopped before reaching target: ({}, {}, {})",
+                target[0],
+                target[1],
+                target[2]
+            );
+            let state = CURRENT_STATE.lock().await;
+            let mut s = state.borrow_mut();
+            s.current_velocity = 0.0;
+            s.distance_remaining = 0.0;
+            s.traveled_distance = 0.0;
+        }
+    }
+}
+
+async fn _move_absolute(io: &mut MotionIO<'_>, target: [f32; 3], feed_rate: f32) {
+    {
+        let state = CURRENT_STATE.lock().await;
+        let mut state = state.borrow_mut();
+        state.target_pos = target;
+        state.target_velocity = feed_rate;
+    }
+
     let state = CURRENT_STATE.lock().await.borrow().clone();
     let [x0, y0, z0] = state.current_pos;
     let [x1, y1, z1] = target;
@@ -347,7 +418,10 @@ impl<'a> MotionIO<'a> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MotionCommand {
-    Linear([f32; 3], f32),
+    MoveAbsolute([f32; 3], f32),
+    MoveRelative([f32; 3], f32),
+    Jog([f32; 3], f32),
+    Stop,
     Zero,
 }
 

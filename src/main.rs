@@ -62,7 +62,7 @@ async fn main_task() {
         match CONTROLLER_CHANNEL.receive().await {
             ControllerCommand::MoveTo(target, max_speed) => {
                 MOTION_QUEUE
-                    .send(MotionCommand::Linear(target, max_speed))
+                    .send(MotionCommand::MoveAbsolute(target, max_speed))
                     .await;
             }
 
