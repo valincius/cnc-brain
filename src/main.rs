@@ -6,11 +6,12 @@ use cnc_brain::motion::{self, MOTION_QUEUE, MOTION_SIGNAL, MotionCommand, STOP_S
 use cnc_brain::receiver::usb_comm_task;
 use cnc_brain::{
     AssignedResources, CONTROLLER_CHANNEL, ControllerCommand, ControllerResources, InputResources,
-    Irqs, StepperResources, jog_wheel, split_resources,
+    Irqs, SpindleResources, StepperResources, jog_wheel, split_resources,
 };
 
 use cortex_m_rt::entry;
 use embassy_executor::{Executor, InterruptExecutor, Spawner};
+use embassy_rp::pwm::{Config, Pwm, SetDutyCycle};
 use embassy_rp::{
     interrupt,
     interrupt::{InterruptExt as _, Priority},
@@ -41,7 +42,9 @@ fn main() -> ! {
         unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
         move || {
             let executor1 = EXECUTOR1.init(Executor::new());
-            executor1.run(|spawner| spawner.must_spawn(controller_task(r.for_controller)));
+            executor1.run(|spawner| {
+                spawner.must_spawn(controller_task(r.for_controller, r.for_spindle))
+            });
         },
     );
 
@@ -78,18 +81,30 @@ async fn main_task() {
 }
 
 #[embassy_executor::task]
-async fn controller_task(r: ControllerResources) {
+async fn controller_task(r: ControllerResources, spindle: SpindleResources) {
     let spawner = Spawner::for_current_executor().await;
 
     let usb_driver = embassy_rp::usb::Driver::new(r.usb, Irqs);
     spawner.spawn(usb_comm_task(usb_driver)).unwrap();
+
+    let mut spindle_speed_pwm = Pwm::new_output_a(spindle.pwm, spindle.speed, Config::default());
 
     loop {
         if let Some(state) = MOTION_SIGNAL.try_take() {
             log::info!("motion_state={:?}", state);
         }
 
-        Timer::after_millis(50).await;
+        spindle_speed_pwm.set_duty_cycle_percent(0).unwrap();
+
+        Timer::after_millis(500).await;
+
+        spindle_speed_pwm.set_duty_cycle_percent(50).unwrap();
+
+        Timer::after_millis(500).await;
+
+        spindle_speed_pwm.set_duty_cycle_percent(75).unwrap();
+
+        Timer::after_millis(500).await;
     }
 }
 

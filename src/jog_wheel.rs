@@ -3,7 +3,7 @@ use embassy_time::{Duration, Timer};
 
 use crate::{
     InputResources,
-    motion::{MOTION_QUEUE, MotionCommand},
+    // motion::{MOTION_QUEUE, MotionCommand},
 };
 
 #[embassy_executor::task]
@@ -31,9 +31,9 @@ pub async fn task(inputs: InputResources) {
             if delta != 0 {
                 let dir = delta > 0;
                 log::info!("Jogging {}", if dir { "forward" } else { "backward" });
-                MOTION_QUEUE
-                    .send(MotionCommand::Jog([0.01 * delta as f32, 0.0, 0.0], 10000.0))
-                    .await;
+                // MOTION_QUEUE
+                //     .send(MotionCommand::Jog([0.01 * delta as f32, 0.0, 0.0], 10000.0))
+                //     .await;
             }
 
             last_state = state;

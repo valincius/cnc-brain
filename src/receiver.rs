@@ -11,9 +11,9 @@ impl CommandHandler {
         if let Some(cmd) = parts.next() {
             match cmd {
                 "go" => {
-                    let x = parts.next().unwrap_or("0").parse().unwrap_or(0.0);
-                    let y = parts.next().unwrap_or("0").parse().unwrap_or(0.0);
-                    let z = parts.next().unwrap_or("0").parse().unwrap_or(0.0);
+                    let x = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                    let y = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                    let z = parts.next().unwrap_or("0").parse().unwrap_or(0);
                     let speed = parts.next().unwrap_or("1000").parse().unwrap_or(1000.0);
 
                     CONTROLLER_CHANNEL

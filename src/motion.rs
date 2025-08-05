@@ -27,10 +27,10 @@ const PIO_CLOCK_HZ: u32 = 125_000_000;
 
 #[derive(Debug, Clone)]
 pub struct MotionState {
-    current_pos: [f32; 3], // Current position of each axis
-    current_velocity: f32,
+    current_pos: [i32; 3], // Current position of each axis
+    target_pos: [i32; 3],
 
-    target_pos: [f32; 3],
+    current_velocity: f32,
     target_velocity: f32,
 
     distance_remaining: f32,
@@ -43,10 +43,10 @@ pub struct MotionState {
 impl MotionState {
     pub const fn new() -> Self {
         Self {
-            current_pos: [0.0; 3],
+            current_pos: [0; 3],
             current_velocity: 0.0,
 
-            target_pos: [0.0; 3],
+            target_pos: [0; 3],
             target_velocity: 0.0,
 
             distance_remaining: 0.0,
@@ -93,7 +93,7 @@ pub async fn motion_task(r: StepperResources) {
     }
 }
 
-async fn jog(io: &mut MotionIO<'_>, offset: [f32; 3], feed_rate: f32) {
+async fn jog(io: &mut MotionIO<'_>, offset: [i32; 3], feed_rate: f32) {
     let state = CURRENT_STATE.lock().await.borrow().clone();
     let feed_rate = feed_rate.max(state.target_velocity);
 
@@ -111,8 +111,8 @@ async fn jog(io: &mut MotionIO<'_>, offset: [f32; 3], feed_rate: f32) {
     move_absolute(io, target, feed_rate).await;
 }
 
-async fn move_relative(io: &mut MotionIO<'_>, offset: [f32; 3], feed_rate: f32) {
-    if feed_rate <= 0.0 {
+async fn move_relative(io: &mut MotionIO<'_>, offset: [i32; 3], feed_rate: f32) {
+    if feed_rate == 0.0 {
         log::warn!("Invalid feed rate: {}", feed_rate);
         return;
     }
@@ -132,8 +132,8 @@ async fn move_relative(io: &mut MotionIO<'_>, offset: [f32; 3], feed_rate: f32) 
     move_absolute(io, target, feed_rate).await;
 }
 
-async fn move_absolute(io: &mut MotionIO<'_>, target: [f32; 3], feed_rate: f32) {
-    if feed_rate <= 0.0 {
+async fn move_absolute(io: &mut MotionIO<'_>, target: [i32; 3], feed_rate: f32) {
+    if feed_rate == 0.0 {
         log::warn!("Invalid feed rate: {}", feed_rate);
         return;
     }
@@ -182,7 +182,7 @@ async fn move_absolute(io: &mut MotionIO<'_>, target: [f32; 3], feed_rate: f32) 
     }
 }
 
-async fn _move_absolute(io: &mut MotionIO<'_>, target: [f32; 3], feed_rate: f32) {
+async fn _move_absolute(io: &mut MotionIO<'_>, target: [i32; 3], feed_rate: f32) {
     {
         let state = CURRENT_STATE.lock().await;
         let mut state = state.borrow_mut();
@@ -202,19 +202,19 @@ async fn _move_absolute(io: &mut MotionIO<'_>, target: [f32; 3], feed_rate: f32)
         return;
     }
 
-    let steps_per_mm = [267.0, 267.0, 267.0];
-    let dx_steps = (dx.abs() * steps_per_mm[0]) as u32;
-    let dy_steps = (dy.abs() * steps_per_mm[1]) as u32;
-    let dz_steps = (dz.abs() * steps_per_mm[2]) as u32;
+    let steps_per_mm: [f32; 3] = [267.0, 267.0, 267.0];
+    let dx_steps = (dx.abs() as f32 * steps_per_mm[0]) as u32;
+    let dy_steps = (dy.abs() as f32 * steps_per_mm[1]) as u32;
+    let dz_steps = (dz.abs() as f32 * steps_per_mm[2]) as u32;
 
     let major_steps = dx_steps.max(dy_steps).max(dz_steps).max(1);
 
     io.dirx
-        .set_level(if dx >= 0.0 { Level::High } else { Level::Low });
+        .set_level(if dx >= 0 { Level::High } else { Level::Low });
     io.diry
-        .set_level(if dy >= 0.0 { Level::High } else { Level::Low });
+        .set_level(if dy >= 0 { Level::High } else { Level::Low });
     io.dirz
-        .set_level(if dz >= 0.0 { Level::High } else { Level::Low });
+        .set_level(if dz >= 0 { Level::High } else { Level::Low });
 
     // S-curve state
     let mut current_velocity = 0.0;
@@ -247,9 +247,9 @@ async fn _move_absolute(io: &mut MotionIO<'_>, target: [f32; 3], feed_rate: f32)
         let delta_dist = current_velocity * DT; // mm
         let frac = delta_dist / total_distance;
 
-        let raw_x = dx * frac * steps_per_mm[0];
-        let raw_y = dy * frac * steps_per_mm[1];
-        let raw_z = dz * frac * steps_per_mm[2];
+        let raw_x = dx as f32 * frac * steps_per_mm[0];
+        let raw_y = dy as f32 * frac * steps_per_mm[1];
+        let raw_z = dz as f32 * frac * steps_per_mm[2];
 
         let sx = raw_x.abs() as u32;
         let sy = raw_y.abs() as u32;
@@ -283,9 +283,9 @@ async fn _move_absolute(io: &mut MotionIO<'_>, target: [f32; 3], feed_rate: f32)
             s.current_velocity = current_velocity;
             s.distance_remaining = remaining - delta_dist;
 
-            s.current_pos[0] += (raw_x / steps_per_mm[0]) as f32;
-            s.current_pos[1] += (raw_y / steps_per_mm[1]) as f32;
-            s.current_pos[2] += (raw_z / steps_per_mm[2]) as f32;
+            s.current_pos[0] += (raw_x / steps_per_mm[0]) as i32;
+            s.current_pos[1] += (raw_y / steps_per_mm[1]) as i32;
+            s.current_pos[2] += (raw_z / steps_per_mm[2]) as i32;
 
             s.current_acceleration = current_acceleration;
             s.deceleration_phase = deceleration_phase;
@@ -418,13 +418,16 @@ impl<'a> MotionIO<'a> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MotionCommand {
-    MoveAbsolute([f32; 3], f32),
-    MoveRelative([f32; 3], f32),
-    Jog([f32; 3], f32),
+    MoveAbsolute([i32; 3], f32),
+    MoveRelative([i32; 3], f32),
+    Jog([i32; 3], f32),
     Stop,
     Zero,
 }
 
-fn dist3d(x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32) -> f32 {
-    hypotf(hypotf(x1 - x0, y1 - y0), z1 - z0)
+fn dist3d(x0: i32, y0: i32, z0: i32, x1: i32, y1: i32, z1: i32) -> f32 {
+    hypotf(
+        hypotf(x1 as f32 - x0 as f32, y1 as f32 - y0 as f32),
+        z1 as f32 - z0 as f32,
+    )
 }

@@ -16,7 +16,7 @@ pub static CONTROLLER_CHANNEL: Channel<CriticalSectionRawMutex, ControllerComman
     Channel::new();
 
 pub enum ControllerCommand {
-    MoveTo([f32; 3], f32),
+    MoveTo([i32; 3], f32),
     Stop,
     Zero,
 }
@@ -34,12 +34,17 @@ assign_resources! {
 
     for_motion: StepperResources {
         pio: PIO0,
-        x_step: PIN_16,
-        x_dir: PIN_17,
-        y_step: PIN_20,
-        y_dir: PIN_21,
-        z_step: PIN_18,
-        z_dir: PIN_19,
+        x_step: PIN_13,
+        y_step: PIN_15,
+        z_step: PIN_14,
+        x_dir: PIN_10,
+        y_dir: PIN_12,
+        z_dir: PIN_11,
+    }
+
+    for_spindle: SpindleResources {
+        pwm: PWM_SLICE0,
+        speed: PIN_16,
     }
 
     for_inputs: InputResources {
